@@ -1,4 +1,4 @@
-# PTPMonitor 使用説明書 (v1.6.3)
+# PTPMonitor 使用説明書 (v1.6.7)
 
 PTPMonitor は、ネットワーク上の PTP (Precision Time Protocol) v1 / v2 通信をキャプチャし、デバイスの稼働状況や Boundary Clock (BC) の動作、トポロジーを可視化・診断する「運用特化型プロトコルアナライザー」です。
 
@@ -13,8 +13,8 @@ PTPMonitor は、ネットワーク上の PTP (Precision Time Protocol) v1 / v2 
 4. ブラウザで `http://localhost:8080/` にアクセスします。
 
 ## 主要診断機能
-### 1. 高精度トポロジー表示
-`Delay_Resp` パケットの解析に基づき、どの Follower がどの Leader に同期しているかを正確にツリー表示します。
+### 1. 高精度トポロジー表示と間隔計測
+`Delay_Resp` パケットの解析に基づき、どの Follower がどの Leader に同期しているかを正確にツリー表示します。また、Follower が送信する `Delay_Req` の受信間隔をリアルタイム計測し、表示します。
 
 ### 2. インテリジェントな競合検知 (BMCA 猶予期間)
 同一ドメイン内に複数の Leader が存在する場合、その状態の深刻度を時間軸で判定します。
@@ -44,5 +44,8 @@ PTPv2 の Announce パケットに加え、PTPv1 (Dante 等) の Sync パケッ�
 
 ## 高度な設定 (config.ini)
 - **OfflineRetentionHours**: オフライン機器を保持する時間（デフォルト: 24時間）。
+- **ExpectedDelayInterval**: Follower の `Delay_Req` の期待間隔（秒）。
+- **DelayAlertThresholdRate**: アラートを出す倍率（デフォルト 1.5）。実際の間隔が 「期待値 × 倍率」 を超えると赤字警告。
+- **OfflineTimeoutSeconds**: オフライン判定までの無通信時間（デフォルト 10.0秒）。
 - **OUI Vendor Mapping**: MACアドレスの先頭（OUI）に基づくベンダー名の定義。
 - **Specific Device Mapping**: 特定のMACアドレスに対して、ホスト名や機器名を個別に割り当て可能。

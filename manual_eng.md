@@ -1,4 +1,4 @@
-# PTPMonitor User Manual (v1.6.3)
+# PTPMonitor User Manual (v1.6.7)
 
 PTPMonitor is a specialized protocol analyzer designed to capture PTP (Precision Time Protocol) v1 / v2 traffic, visualize device status, Boundary Clock (BC) operations, and network topology for high-precision diagnostic purposes.
 
@@ -43,6 +43,9 @@ Correctly identifies true GMs by extracting `grandmasterClockId` from PTPv2 Anno
 - **Auto-Rotation**: Performed on startup or when the log file size exceeds 10MB.
 
 ## Advanced Configuration (config.ini)
-- **OfflineRetentionHours**: Duration to retain offline devices (default: 24h).
+- **OfflineRetentionHours**: Duration to retain offline devices in the list (default: 24h).
+- **ExpectedDelayInterval**: Expected interval for Follower `Delay_Req` packets (seconds). Used as a baseline for alerting.
+- **DelayAlertThresholdRate**: Tolerance multiplier for alerting (default 1.5). UI highlights red if actual interval > (Expected * Rate).
+- **OfflineTimeoutSeconds**: Seconds of inactivity before a node is marked as offline (default 10.0s).
 - **OUI Vendor Mapping**: Vendor name definitions based on MAC address prefix (OUI).
 - **Specific Device Mapping**: Manually assign names or hostnames to specific MAC addresses.

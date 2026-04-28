@@ -21,6 +21,7 @@ class ProtocolState {
     public int? DelayRespLog { get; set; }
     
     public DateTime? LastSyncReceived { get; set; }
+    public DateTime? LastDelayReqSeen { get; set; }
     public double? LastMeasuredIntervalMs { get; set; }
     public double? StabilityJitterMs { get; set; }
     
@@ -77,6 +78,9 @@ class Program {
     static readonly int[] Ports = new int[] { 319, 320 };
     static string WebPort = "8080";
     static double OfflineRetentionHours = 24.0;
+    static double ExpectedDelayInterval = 2.0;    // Added in v1.6.7
+    static double DelayAlertThresholdRate = 1.5;  // Added in v1.6.7
+    static double OfflineTimeoutSeconds = 10.0;   // Added in v1.6.7
     
     static Dictionary<string, DeviceInfo> devices = new Dictionary<string, DeviceInfo>();
     static Dictionary<string, string> followerToLeaderV1 = new Dictionary<string, string>();
@@ -94,7 +98,7 @@ class Program {
 
     static void Main(string[] args) {
         LoadConfig();
-        Console.WriteLine("=== PTPMonitor v1.6.3 (Final Version) ===");
+        Console.WriteLine("=== PTPMonitor v1.6.7 (Final Version) ===");
         
         NetworkInterface[] nics = NetworkInterface.GetAllNetworkInterfaces();
         List<IPAddress> validIps = new List<IPAddress>();
@@ -193,6 +197,12 @@ class Program {
                         string val = parts[1].Trim();
                         if (key.Equals("OfflineRetentionHours", StringComparison.OrdinalIgnoreCase)) {
                             double.TryParse(val, out OfflineRetentionHours);
+                        } else if (key.Equals("ExpectedDelayInterval", StringComparison.OrdinalIgnoreCase)) {
+                            double.TryParse(val, out ExpectedDelayInterval);
+                        } else if (key.Equals("DelayAlertThresholdRate", StringComparison.OrdinalIgnoreCase)) {
+                            double.TryParse(val, out DelayAlertThresholdRate);
+                        } else if (key.Equals("OfflineTimeoutSeconds", StringComparison.OrdinalIgnoreCase)) {
+                            double.TryParse(val, out OfflineTimeoutSeconds);
                         } else {
                             customVendors[key.ToUpper()] = val;
                         }
@@ -378,6 +388,14 @@ class Program {
                 }
             }
 
+
+            if (role == "Follower" && (msgType == 1 || (protoVer == "v1" && data[20] == 1))) {
+                if (pState.LastDelayReqSeen.HasValue) {
+                    pState.LastMeasuredIntervalMs = (DateTime.Now - pState.LastDelayReqSeen.Value).TotalMilliseconds;
+                }
+                pState.LastDelayReqSeen = DateTime.Now;
+            }
+
             if (!dev.HasJoined) { dev.HasJoined = true; Log(string.Format("[JOIN] {0} ({1}) joined as {2}", ip, dev.Mac, role)); }
             if (oldRole != role && role != "Unknown") { pState.RoleChangedAt = DateTime.Now; Log(string.Format("[ROLE_CHANGE] {0} ({1}) {2} -> {3}", ip, protoVer, oldRole, role)); }
         }
@@ -390,7 +408,7 @@ class Program {
                 foreach(var kvp in devices) {
                     var dev = kvp.Value;
                     double idle = (DateTime.Now - dev.LastSeen).TotalSeconds;
-                    if (idle >= 10.0 && dev.IsOnline) { dev.IsOnline = false; Log(string.Format("[OFFLINE] {0} ({1}) stopped responding.", GetVendorSafe(dev.Mac), dev.IP)); }
+                    if (idle >= OfflineTimeoutSeconds && dev.IsOnline) { dev.IsOnline = false; Log(string.Format("[OFFLINE] {0} ({1}) stopped responding.", GetVendorSafe(dev.Mac), dev.IP)); }
                     if (OfflineRetentionHours > 0 && idle >= (OfflineRetentionHours * 3600.0)) toRemove.Add(kvp.Key);
                 }
                 foreach(var k in toRemove) {
@@ -435,7 +453,7 @@ class Program {
             Log("[SYSTEM] Network state and logs cleared by WebUI.");
             res.StatusCode = 200; res.Close(); return;
         } else if (path == "/api/data") {
-            var sb = new StringBuilder(); sb.Append("{");
+            var sb = new StringBuilder(); sb.Append("{\"expectedDelayInterval\":"+ExpectedDelayInterval+",\"delayAlertThresholdRate\":"+DelayAlertThresholdRate+",");
             lock(devices) {
                 sb.Append("\"devices\":["); bool f = true;
                 foreach(var dev in devices.Values) {
@@ -452,9 +470,10 @@ class Program {
                         sb.Append("\""+p.Key+"\":{\"role\":\""+p.Value.Role+"\",\"domain\":\""+p.Value.Domain+"\",\"ownId\":\""+(p.Value.OwnId??"")+"\",");
                         sb.Append("\"syncLog\":"+(p.Value.SyncLog.HasValue ? p.Value.SyncLog.Value.ToString() : "null")+",\"announceLog\":"+(p.Value.AnnounceLog.HasValue ? p.Value.AnnounceLog.Value.ToString() : "null")+",");
                         sb.Append("\"gmId\":\""+(p.Value.GrandmasterId??"")+"\",\"vendor\":\""+GetVendorSafe(dev.Mac)+"\",");
-                        sb.Append("\"isConflict\":"+(p.Value.IsConflict?"true":"false")+",");
-                        sb.Append("\"conflictSeconds\":"+(p.Value.ConflictStartedAt.HasValue?(int)(DateTime.Now-p.Value.ConflictStartedAt.Value).TotalSeconds:0)+",");
-                        sb.Append("\"parentIp\":\""+pip+"\",");
+                         sb.Append("\"isConflict\":"+(p.Value.IsConflict?"true":"false")+",");
+                         sb.Append("\"conflictSeconds\":"+(p.Value.ConflictStartedAt.HasValue?(int)(DateTime.Now-p.Value.ConflictStartedAt.Value).TotalSeconds:0)+",");
+                         sb.Append("\"lastMeasuredIntervalMs\":"+(p.Value.LastMeasuredIntervalMs.HasValue?((int)p.Value.LastMeasuredIntervalMs.Value).ToString():"null")+",");
+                         sb.Append("\"parentIp\":\""+pip+"\",");
                         sb.Append("\"roleElapsedSeconds\":"+(p.Value.RoleChangedAt.HasValue?(int)(DateTime.Now-p.Value.RoleChangedAt.Value).TotalSeconds:-1)+"}");
                     }
                     sb.Append("}}");
@@ -470,7 +489,7 @@ class Program {
         res.Close();
     }
 
-    static readonly string HtmlContent = @"<!DOCTYPE html><html><head><meta charset=""UTF-8""><title>PTPMonitor v1.6.3</title>
+    static readonly string HtmlContent = @"<!DOCTYPE html><html><head><meta charset=""UTF-8""><title>PTPMonitor v1.6.7</title>
 <link href=""https://fonts.googleapis.com/css2?family=Inter:wght@400;600&family=Outfit:wght@700&display=swap"" rel=""stylesheet"">
 <style>
 :root{--bg:#0b0f19;--glass:rgba(255,255,255,0.03);--border:rgba(255,255,255,0.08);--accent:#00d2ff;--leader:#ff7090;--follower:#5de8b8;--offline:#4a5568;}
@@ -500,7 +519,7 @@ button:hover{border-color:var(--accent);}
 </style></head>
 <body><div class=""container"">
 <header>
-    <h1>PTP Monitor <small style=""font-size:0.5em;opacity:0.5"">v1.6.3</small></h1>
+    <h1>PTP Monitor <small style=""font-size:0.5em;opacity:0.5"">v1.6.7</small></h1>
     <div class=""header-actions"">
         <button onclick=""fetch('/api/clear_all',{method:'POST'}); fetchUI();"">↻ Network Clear</button>
         <button onclick=""fetch('/api/clear_offline',{method:'POST'}); fetchUI();"">🗑 Clear Offline</button>
@@ -576,7 +595,7 @@ async function fetchUI() {
                     let gmIdText = p.gmId || (role === 'follower' ? parentGmId : 'N/A');
                     let gmStyle = isMismatch ? 'color:#ff4a4a;font-weight:bold;background:rgba(255,50,50,0.1);padding:2px 4px;border-radius:4px;' : 'opacity:0.9;';
                     let gmLine = `<div class=""info-row"" style=""${gmStyle}margin-top:6px;font-family:monospace;"">GM: ${esc(gmIdText)}${isMismatch?' <span style=""margin-left:4px;"">⚠️ GM Mismatch!</span>':''}</div>`;
-                    let logLine = role === 'leader' ? `<div class=""info-row"" style=""opacity:0.7"">Sync: ${valS(p.syncLog)} / Announce: ${valS(p.announceLog)}</div>` : '';
+                    let logLine = (role === 'leader' && v === 'v2') ? `<div class=""info-row"" style=""opacity:0.7"">Sync: ${valS(p.syncLog)} / Announce: ${valS(p.announceLog)}</div>` : '';
                     
                     let badgeText = esc(p.role);
                     if (isConflict === 'bmca') badgeText = 'BMCA (Negotiating)';
@@ -593,6 +612,7 @@ async function fetchUI() {
                         <div class=""info-row"">MAC: ${esc(dev.mac)} | Vendor: ${esc(p.vendor || 'Unknown')}</div>
                         <div class=""info-row"" style=""color:${dev.online?'var(--follower)':'var(--leader)'};opacity:0.8"">
                             ${dev.online ? 'Uptime: '+hhmmss(dev.uptimeSeconds) : 'Offline: '+hhmmss(dev.idleSeconds)}
+                            ${p.lastMeasuredIntervalMs ? ` | Delay Intv: <span style=""${p.lastMeasuredIntervalMs > (d.expectedDelayInterval * d.delayAlertThresholdRate * 1000) ? 'color:#ff4a4a;font-weight:bold' : ''}"">${(p.lastMeasuredIntervalMs/1000.0).toFixed(2)} s</span>` : ''}
                         </div>
                         ${gmLine}
                         ${logLine}

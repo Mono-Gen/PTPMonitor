@@ -1,0 +1,4 @@
+- [x] `manual_eng.md` -> `manual_EN.md` へリネーム
+- [x] `manual_jp.md` -> `manual_JP.md` へリネーム
+- [x] `PTPMonitor.cs` にXMLコメントを追加
+- [x] 変更内容の最終確認

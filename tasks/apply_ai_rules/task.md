@@ -1,0 +1,5 @@
+- [x] https://github.com/Mono-Gen/ai-rules をクローン
+- [x] `.agents` フォルダをカレントディレクトリに配置
+- [x] `.agents/config.md` のルールを有効化
+- [x] `.gitignore` の設定確認
+- [x] 本ドキュメント（task.md, walkthrough.md等）の作成

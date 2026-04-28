@@ -1,4 +1,4 @@
-# PTPMonitor 使用説明書 (v1.6.7)
+# PTPMonitor 使用説明書 (v1.6.8)
 
 PTPMonitor は、ネットワーク上の PTP (Precision Time Protocol) v1 / v2 通信をキャプチャし、デバイスの稼働状況や Boundary Clock (BC) の動作、トポロジーを可視化・診断する「運用特化型プロトコルアナライザー」です。
 

@@ -9,6 +9,9 @@ using System.Threading.Tasks;
 using System.Text;
 using System.Linq;
 
+/// <summary>
+/// Holds the state for each PTP domain and version.
+/// </summary>
 class ProtocolState {
     public string Role { get; set; }
     public string Domain { get; set; }
@@ -53,6 +56,10 @@ class ProtocolState {
     }
 }
 
+/// <summary>
+/// Holds information for each device on the network.
+/// Manages multiple protocol states in a dictionary.
+/// </summary>
 class DeviceInfo {
     public string IP { get; set; }
     public string Mac { get; set; }
@@ -73,14 +80,18 @@ class DeviceInfo {
     }
 }
 
+/// <summary>
+/// Main program class for PTPMonitor.
+/// Controls packet capture, monitoring loops, and the web server.
+/// </summary>
 class Program {
     static readonly string McastGroup = "224.0.1.129";
     static readonly int[] Ports = new int[] { 319, 320 };
     static string WebPort = "8080";
     static double OfflineRetentionHours = 24.0;
-    static double ExpectedDelayInterval = 2.0;    // Added in v1.6.7
-    static double DelayAlertThresholdRate = 1.5;  // Added in v1.6.7
-    static double OfflineTimeoutSeconds = 10.0;   // Added in v1.6.7
+    static double ExpectedDelayInterval = 2.0;    // Added in v1.6.8
+    static double DelayAlertThresholdRate = 1.5;  // Added in v1.6.8
+    static double OfflineTimeoutSeconds = 10.0;   // Added in v1.6.8
     
     static Dictionary<string, DeviceInfo> devices = new Dictionary<string, DeviceInfo>();
     static Dictionary<string, string> followerToLeaderV1 = new Dictionary<string, string>();
@@ -96,9 +107,12 @@ class Program {
     static IPAddress currentLocalIp = IPAddress.Any;
     static HttpListener httpListener = new HttpListener();
 
+    /// <summary>
+    /// Entry point. Handles interface selection and starts monitoring tasks.
+    /// </summary>
     static void Main(string[] args) {
         LoadConfig();
-        Console.WriteLine("=== PTPMonitor v1.6.7 (Final Version) ===");
+        Console.WriteLine("=== PTPMonitor v1.6.8 (Final Version) ===");
         
         NetworkInterface[] nics = NetworkInterface.GetAllNetworkInterfaces();
         List<IPAddress> validIps = new List<IPAddress>();
@@ -137,7 +151,8 @@ class Program {
         foreach (int port in Ports) {
             var sock = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
             sock.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
-            sock.Bind(new IPEndPoint(IPAddress.Any, port));
+            sock.ReceiveTimeout = 1000;
+            sock.Bind(new IPEndPoint(currentLocalIp, port));
             sock.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.AddMembership, new MulticastOption(IPAddress.Parse(McastGroup), currentLocalIp));
             sockets.Add(sock);
             Task.Factory.StartNew(() => {
@@ -173,6 +188,9 @@ class Program {
         while (!cts.Token.IsCancellationRequested) Thread.Sleep(100);
     }
 
+    /// <summary>
+    /// Loads settings (retention, thresholds, OUI maps, etc.) from config.ini.
+    /// </summary>
     static void LoadConfig() {
         try {
             string path = "config.ini";
@@ -212,6 +230,9 @@ class Program {
         } catch {}
     }
 
+    /// <summary>
+    /// Rotates log files on startup and when size exceeds the limit.
+    /// </summary>
     static void RotateLogFile() {
         if (logWriter != null) { logWriter.Close(); logWriter = null; }
         string logDir = "logs";
@@ -225,6 +246,9 @@ class Program {
         if (logWriter != null) logWriter.WriteLine(string.Format("[{0:yyyy-MM-dd HH:mm:ss}] --- Log Session Started ---", DateTime.Now));
     }
 
+    /// <summary>
+    /// Outputs message to console and log file. Keeps a short history in memory.
+    /// </summary>
     static void Log(string message) {
         string timestamp = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
         string clean = string.Format("[{0}] {1}", timestamp, System.Text.RegularExpressions.Regex.Replace(message, @"\x1B\[[^m]*m", ""));
@@ -237,6 +261,9 @@ class Program {
         lock(logLock) { logs.Add(clean); if(logs.Count > 500) logs.RemoveAt(0); }
     }
 
+    /// <summary>
+    /// Safely retrieves vendor name from MAC address or OUI.
+    /// </summary>
     static string GetVendorSafe(string mac) {
         if(string.IsNullOrEmpty(mac) || mac == "Unknown") return "-";
         string upperMac = mac.ToUpper();
@@ -250,6 +277,9 @@ class Program {
         return "Unknown";
     }
 
+    /// <summary>
+    /// Parses received PTP packets and updates device state. Supports PTPv1 and v2.
+    /// </summary>
     static void ParsePacket(string ip, byte[] data, int len, int port) {
         if (len < 34) return;
         int versionField = data[1] & 0x0F;
@@ -401,6 +431,9 @@ class Program {
         }
     }
 
+    /// <summary>
+    /// Background loop for device online status monitoring and data retention management.
+    /// </summary>
     static void MonitorLoop() {
         while(!cts.Token.IsCancellationRequested) {
             lock(devices) {
@@ -422,6 +455,9 @@ class Program {
         }
     }
 
+    /// <summary>
+    /// Loop for starting the Web UI HTTP server and waiting for requests.
+    /// </summary>
     static void WebServerLoop() {
         httpListener.Prefixes.Add("http://localhost:" + WebPort + "/");
         httpListener.Prefixes.Add("http://127.0.0.1:" + WebPort + "/");
@@ -431,6 +467,9 @@ class Program {
         }
     }
 
+    /// <summary>
+    /// Processes HTTP requests and returns API data (JSON) or HTML content.
+    /// </summary>
     static void ProcessRequest(HttpListenerContext context) {
         var res = context.Response; string path = context.Request.Url.AbsolutePath;
         
@@ -489,7 +528,7 @@ class Program {
         res.Close();
     }
 
-    static readonly string HtmlContent = @"<!DOCTYPE html><html><head><meta charset=""UTF-8""><title>PTPMonitor v1.6.7</title>
+    static readonly string HtmlContent = @"<!DOCTYPE html><html><head><meta charset=""UTF-8""><title>PTPMonitor v1.6.8</title>
 <link href=""https://fonts.googleapis.com/css2?family=Inter:wght@400;600&family=Outfit:wght@700&display=swap"" rel=""stylesheet"">
 <style>
 :root{--bg:#0b0f19;--glass:rgba(255,255,255,0.03);--border:rgba(255,255,255,0.08);--accent:#00d2ff;--leader:#ff7090;--follower:#5de8b8;--offline:#4a5568;}
@@ -516,13 +555,24 @@ button:hover{border-color:var(--accent);}
 .dashboard{display:grid;grid-template-columns:repeat(5,1fr);gap:1.5rem;margin-bottom:1.5rem;}
 .dash-item{background:var(--glass);padding:1rem;border-radius:12px;border:1px solid var(--border);font-size:0.8rem;}
 .dash-value{font-size:1.8rem;font-weight:bold;margin-top:4px;}
+.live-indicator{display:inline-flex;align-items:center;gap:6px;font-size:0.75rem;color:#aaa;background:rgba(255,255,255,0.05);padding:4px 10px;border-radius:20px;border:1px solid var(--border);}
+.dot{width:8px;height:8px;background:var(--follower);border-radius:50%;box-shadow:0 0 8px var(--follower);animation:pulse 2s infinite;}
+@keyframes pulse{0%{opacity:1;transform:scale(1);}50%{opacity:0.3;transform:scale(1.2);}100%{opacity:1;transform:scale(1);}}
 </style></head>
 <body><div class=""container"">
 <header>
-    <h1>PTP Monitor <small style=""font-size:0.5em;opacity:0.5"">v1.6.7</small></h1>
+    <div>
+        <h1 style=""margin:0"">PTP Monitor <small style=""font-size:0.5em;opacity:0.5"">v1.6.8</small></h1>
+        <div class=""live-indicator"" style=""margin-top:8px"">
+            <span class=""dot""></span>
+            <span>LIVE MONITORING</span>
+            <span style=""margin-left:8px;opacity:0.6"">|</span>
+            <span id=""last-update"" style=""margin-left:8px"">Waiting for data...</span>
+        </div>
+    </div>
     <div class=""header-actions"">
-        <button onclick=""fetch('/api/clear_all',{method:'POST'}); fetchUI();"">↻ Network Clear</button>
-        <button onclick=""fetch('/api/clear_offline',{method:'POST'}); fetchUI();"">🗑 Clear Offline</button>
+        <button onclick=""if(confirm('Reset all network data and logs?')) { fetch('/api/clear_all',{method:'POST'}); fetchUI(); }"">↻ Network Clear</button>
+        <button onclick=""if(confirm('Clear all offline devices from the list?')) { fetch('/api/clear_offline',{method:'POST'}); fetchUI(); }"">🗑 Clear Offline</button>
         <button onclick=""exportCSV()"">⬇ Export CSV</button>
     </div>
 </header>
@@ -561,6 +611,7 @@ async function fetchUI() {
 
         const stats = [['Active Nodes', counts.nodes], ['Leaders', counts.leaders], ['v1/v2 Followers', `${counts.v1f}/${counts.v2f}`], ['Boundary Clocks (bc)', counts.bcs], ['Conflicts', counts.conflicts]];
         document.getElementById('dash').innerHTML = stats.map(s => `<div class=""dash-item""><div style=""color:#aaa"">${s[0]}</div><div class=""dash-value"">${s[1]}</div></div>`).join('');
+        document.getElementById('last-update').innerText = 'Last Update: ' + new Date().toLocaleTimeString();
 
         ['v1', 'v2'].forEach(v => {
             const domains = [...new Set(d.devices.map(dev => dev.protocols[v]?.domain).filter(x => x !== undefined))].sort();

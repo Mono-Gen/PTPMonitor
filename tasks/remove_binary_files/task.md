@@ -1,3 +1,0 @@
-- [x] `git rm --cached` で `PTPMonitor_v1.6.7.zip` を除外
-- [x] 変更をコミット
-- [x] `git ls-files` で確認

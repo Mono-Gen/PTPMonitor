@@ -1,3 +1,0 @@
-- [x] `git config` で `user.name` と `user.email` を設定
-- [x] `git rebase --root` で全履歴のコミットAuthorを修正
-- [x] `git log` で全履歴の修正を確認

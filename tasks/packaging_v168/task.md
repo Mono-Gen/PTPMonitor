@@ -1,3 +1,0 @@
-- [x] 配布対象ファイルの確認
-- [x] `Compress-Archive` でZipを作成
-- [x] 生成された `PTPMonitor_v1.6.8.zip` の存在確認

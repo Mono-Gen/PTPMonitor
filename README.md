@@ -25,6 +25,8 @@ Run `PTPMonitor.exe` (requires proper configuration in `config.ini`).
     - Added Live Monitoring indicator and Last Update timestamp to Web UI.
     - Implemented explicit IP binding for sockets to improve multi-NIC stability.
     - Added socket receive timeouts to prevent potential hangs.
+- **UI/UX Enhancement**:
+    - Created a professional application icon and integrated it into the Windows executable build process.
 
 
 

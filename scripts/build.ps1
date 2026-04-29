@@ -11,7 +11,9 @@ if (!(Test-Path $outDir)) {
 
 Write-Host "Building PTPMonitor..." -ForegroundColor Cyan
 
-& $cscPath /out:$outFile /r:System.dll,System.Core.dll $srcFile
+$iconFile = "assets\app_icon.ico"
+
+& $cscPath /out:$outFile /win32icon:$iconFile /r:System.dll,System.Core.dll $srcFile
 
 if ($LASTEXITCODE -eq 0) {
     Write-Host "Build Successful: $outFile" -ForegroundColor Green

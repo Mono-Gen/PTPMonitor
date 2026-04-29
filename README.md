@@ -2,14 +2,16 @@
 
 PTP (Precision Time Protocol) monitoring and diagnostic tool.
 
+![Dashboard Screenshot](assets/dashboard_live.png)
+
 ## Features
 - Network diagnostic for PTPv1/v2.
 - Real-time status visualization.
 - BMC Algorithm status analysis.
 
 ## Documentation
-- [Manual (JP)](manual_JP.md)
-- [Manual (ENG)](manual_EN.md)
+- [Manual (JP)](docs/manual_JP.md)
+- [Manual (ENG)](docs/manual_EN.md)
 
 ## How to use
 Run `PTPMonitor.exe` (requires proper configuration in `config.ini`).

@@ -528,9 +528,10 @@ class Program {
         res.Close();
     }
 
-    static readonly string HtmlContent = @"<!DOCTYPE html><html><head><meta charset=""UTF-8""><title>PTPMonitor v1.6.8</title>
-<link href=""https://fonts.googleapis.com/css2?family=Inter:wght@400;600&family=Outfit:wght@700&display=swap"" rel=""stylesheet"">
-<style>
+    static readonly string HtmlHeader = @"<!DOCTYPE html><html><head><meta charset=""UTF-8""><title>PTPMonitor v1.6.8</title>
+<link href=""https://fonts.googleapis.com/css2?family=Inter:wght@400;600&family=Outfit:wght@700&display=swap"" rel=""stylesheet"">";
+
+    static readonly string HtmlStyle = @"<style>
 :root{--bg:#0b0f19;--glass:rgba(255,255,255,0.03);--border:rgba(255,255,255,0.08);--accent:#00d2ff;--leader:#ff7090;--follower:#5de8b8;--offline:#4a5568;}
 body{margin:0;padding:1.5rem;background:var(--bg);color:#e2e8f0;font-family:'Inter',sans-serif;}
 .container{max-width:1400px;margin:0 auto;}
@@ -558,8 +559,9 @@ button:hover{border-color:var(--accent);}
 .live-indicator{display:inline-flex;align-items:center;gap:6px;font-size:0.75rem;color:#aaa;background:rgba(255,255,255,0.05);padding:4px 10px;border-radius:20px;border:1px solid var(--border);}
 .dot{width:8px;height:8px;background:var(--follower);border-radius:50%;box-shadow:0 0 8px var(--follower);animation:pulse 2s infinite;}
 @keyframes pulse{0%{opacity:1;transform:scale(1);}50%{opacity:0.3;transform:scale(1.2);}100%{opacity:1;transform:scale(1);}}
-</style></head>
-<body><div class=""container"">
+</style>";
+
+    static readonly string HtmlBody = @"</head><body><div class=""container"">
 <header>
     <div>
         <h1 style=""margin:0"">PTP Monitor <small style=""font-size:0.5em;opacity:0.5"">v1.6.8</small></h1>
@@ -573,17 +575,18 @@ button:hover{border-color:var(--accent);}
     <div class=""header-actions"">
         <button onclick=""if(confirm('Reset all network data and logs?')) { fetch('/api/clear_all',{method:'POST'}); fetchUI(); }"">↻ Network Clear</button>
         <button onclick=""if(confirm('Clear all offline devices from the list?')) { fetch('/api/clear_offline',{method:'POST'}); fetchUI(); }"">🗑 Clear Offline</button>
-        <button onclick=""exportCSV()"">⬇ Export CSV</button>
+        <button onclick=""exportCSV()"">" + "\u2B07" + @" Export CSV</button>
     </div>
 </header>
 <div class=""dashboard"" id=""dash""></div>
 <div class=""grid"">
-<div class=""glass""><h3>📡 v1 Topology</h3><div id=""v1""></div></div>
-<div class=""glass""><h3>📡 v2 Topology</h3><div id=""v2""></div></div>
+<div class=""glass""><h3>" + "\U0001F4E1" + @" v1 Topology</h3><div id=""v1""></div></div>
+<div class=""glass""><h3>" + "\U0001F4E1" + @" v2 Topology</h3><div id=""v2""></div></div>
 </div>
 <div class=""glass""><h3>Event Logs</h3><div id=""l"" class=""logs""></div></div>
-</div>
-<script>
+</div>";
+
+    static readonly string HtmlScripts = @"<script>
 function esc(t){ if(t === 0) return '0'; if(!t) return ''; return String(t).replace(/[&<>/""']/g, s=>({'&':'&amp;','<':'&lt;','>':'&gt;','/':'&#47;','""':'&quot;',""'"":""&#39;""}[s])); }
 function valS(v) { return v === null ? 'N/A' : v; }
 function hhmmss(s) { if(s<0)return'00:00:00'; let h=Math.floor(s/3600),m=Math.floor((s%3600)/60),sec=Math.floor(s%60); return String(h).padStart(2,'0')+':'+String(m).padStart(2,'0')+':'+String(sec).padStart(2,'0'); }
@@ -645,7 +648,7 @@ async function fetchUI() {
                     
                     let gmIdText = p.gmId || (role === 'follower' ? parentGmId : 'N/A');
                     let gmStyle = isMismatch ? 'color:#ff4a4a;font-weight:bold;background:rgba(255,50,50,0.1);padding:2px 4px;border-radius:4px;' : 'opacity:0.9;';
-                    let gmLine = `<div class=""info-row"" style=""${gmStyle}margin-top:6px;font-family:monospace;"">GM: ${esc(gmIdText)}${isMismatch?' <span style=""margin-left:4px;"">⚠️ GM Mismatch!</span>':''}</div>`;
+                    let gmLine = `<div class=""info-row"" style=""${gmStyle}margin-top:6px;font-family:monospace;"">GM: ${esc(gmIdText)}${isMismatch?' <span style=""margin-left:4px;"">\u26A0 GM Mismatch!</span>':''}</div>`;
                     let logLine = (role === 'leader' && v === 'v2') ? `<div class=""info-row"" style=""opacity:0.7"">Sync: ${valS(p.syncLog)} / Announce: ${valS(p.announceLog)}</div>` : '';
                     
                     let badgeText = esc(p.role);
@@ -699,4 +702,6 @@ function exportCSV(){
 }
 fetchUI();
 </script></body></html>";
+
+    static readonly string HtmlContent = HtmlHeader + HtmlStyle + HtmlBody + HtmlScripts;
 }

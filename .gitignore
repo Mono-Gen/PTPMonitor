@@ -23,13 +23,6 @@ Desktop.ini
 Log/
 logs/
 
-# Internal documents and tasks
-.docs/
-tasks/
-.tasks/
-archives/
-venv/
-.agents/
 
 # Security
 .env

@@ -1,0 +1,46 @@
+# OS files
+Thumbs.db
+db.
+Desktop.ini
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# IDEs and Editors
+.vscode/
+.idea/
+.vs/
+*.swp
+*.swo
+*.user
+*.suo
+*.sln.docstates
+*~
+
+# Temporary files
+*.tmp
+*.log
+Log/
+logs/
+
+# Documentation & Internal Tasks (Local only)
+.docs/
+tasks/
+.tasks/
+archives/
+venv/
+.agents/
+
+# Security
+.env
+.env.*
+
+# Build Artifacts
+bin/
+obj/
+*.exe
+*.dll
+*.pdb
+*.zip
+*.msi
+*.tar.gz

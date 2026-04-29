@@ -573,8 +573,8 @@ button:hover{border-color:var(--accent);}
         </div>
     </div>
     <div class=""header-actions"">
-        <button onclick=""if(confirm('Reset all network data and logs?')) { fetch('/api/clear_all',{method:'POST'}); fetchUI(); }"">↻ Network Clear</button>
-        <button onclick=""if(confirm('Clear all offline devices from the list?')) { fetch('/api/clear_offline',{method:'POST'}); fetchUI(); }"">🗑 Clear Offline</button>
+        <button onclick=""if(confirm('Reset all network data and logs?')) { fetch('/api/clear_all',{method:'POST'}); fetchUI(); }"">\u21BB Network Clear</button>
+        <button onclick=""if(confirm('Clear all offline devices from the list?')) { fetch('/api/clear_offline',{method:'POST'}); fetchUI(); }"">\U0001F5D1 Clear Offline</button>
         <button onclick=""exportCSV()"">" + "\u2B07" + @" Export CSV</button>
     </div>
 </header>
@@ -644,7 +644,7 @@ async function fetchUI() {
                     const isConflict = p.conflictSeconds > 0 ? (isPersistent ? 'conflict' : 'bmca') : '';
                     const color = role === 'leader' ? '#ff7090' : (role === 'follower' ? '#5de8b8' : '#e2e8f0');
                     const indent = depth * 25;
-                    const arrow = depth > 0 ? `<span style=""color:#5de8b8;margin-right:6px;"">↳</span>` : '';
+                    const arrow = depth > 0 ? `<span style=""color:#5de8b8;margin-right:6px;"">\u21B3</span>` : '';
                     
                     let gmIdText = p.gmId || (role === 'follower' ? parentGmId : 'N/A');
                     let gmStyle = isMismatch ? 'color:#ff4a4a;font-weight:bold;background:rgba(255,50,50,0.1);padding:2px 4px;border-radius:4px;' : 'opacity:0.9;';

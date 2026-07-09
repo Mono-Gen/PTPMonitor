@@ -18,6 +18,25 @@ Run `PTPMonitor.exe` (requires proper configuration in `config.ini`).
 
 ## Changelog
 
+### [v1.7.0] - 2026-07-09
+#### Fixed
+- **PTPv1 (Dante) Parsing Overhaul**:
+    - Message classification now uses the `control` field (offset 32) per IEEE 1588-2002; previously unreachable conditions prevented v1 GM extraction, SyncLog updates, and Delay_Resp topology linking from ever running.
+    - Corrected wire-format offsets verified against the Wireshark PTP dissector: `grandmasterClockUuid` (54), `syncInterval` (83), `requestingSourceUuid` (50).
+- **Web UI Stability**:
+    - JSON responses are now properly escaped and locale-independent (fixes dashboard breakage on comma-decimal locales or malformed v1 subdomains).
+    - HTTP responses are always closed (`try-finally`), preventing socket leaks and server hangs after client disconnects.
+    - Fixed polling-loop multiplication when clicking Clear buttons; fixed v1/v2 follower counting; fixed garbled button icons.
+- **Configuration Robustness**: Invalid numeric values in `config.ini` no longer overwrite defaults with 0; parsing is culture-invariant; values may contain `=`.
+#### Changed
+- Web server now handles requests concurrently and reports startup failures (e.g., port in use).
+- Packet receiving uses blocking sockets (no more per-second timeout exceptions); errors are classified and logged.
+- Removed external Google Fonts dependency so the dashboard renders fully offline.
+- CSV export now escapes quotes and neutralizes spreadsheet formula injection.
+#### Added
+- BMC info (`Priority1` / `ClockClass` / `Priority2`) display for PTPv2 Leaders.
+- Device-count cap (512) as a memory-safety guard.
+
 ### [v1.6.8] - 2026-04-29
 #### Added
 - **Safety & Robustness**:

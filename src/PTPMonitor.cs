@@ -8,6 +8,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.Text;
 using System.Linq;
+using System.Globalization;
 
 /// <summary>
 /// Holds the state for each PTP domain and version.
@@ -16,29 +17,17 @@ class ProtocolState {
     public string Role { get; set; }
     public string Domain { get; set; }
     public string OwnId { get; set; }
-    public string ParentId { get; set; }
     public string GrandmasterId { get; set; }
     public int? SyncLog { get; set; }
     public int? AnnounceLog { get; set; }
-    public int? DelayReqLog { get; set; }
-    public int? DelayRespLog { get; set; }
-    
-    public DateTime? LastSyncReceived { get; set; }
+
     public DateTime? LastDelayReqSeen { get; set; }
     public double? LastMeasuredIntervalMs { get; set; }
-    public double? StabilityJitterMs { get; set; }
-    
-    public DateTime LastSeen { get; set; }
-    public bool IsOnline { get; set; }
-    
+
     public int? GmPriority1 { get; set; }
     public int? GmPriority2 { get; set; }
     public int? GmClass { get; set; }
-    public string GmClassDesc { get; set; }
 
-    public bool TcTraversed { get; set; }
-    public double CorrectionNs { get; set; }
-    public string ProfileId { get; set; }
     public bool IsConflict { get; set; }
     public DateTime? RoleChangedAt { get; set; }
     public DateTime? ConflictStartedAt { get; set; }
@@ -47,11 +36,7 @@ class ProtocolState {
         Role = "Unknown";
         Domain = "0";
         OwnId = null;
-        ParentId = null;
         GrandmasterId = null;
-        ProfileId = "Standard PTP";
-        LastSeen = DateTime.Now;
-        IsOnline = true;
         IsConflict = false;
     }
 }
@@ -92,7 +77,9 @@ class Program {
     static double ExpectedDelayInterval = 2.0;    // Added in v1.6.8
     static double DelayAlertThresholdRate = 1.5;  // Added in v1.6.8
     static double OfflineTimeoutSeconds = 10.0;   // Added in v1.6.8
-    
+    static readonly int MaxDevices = 512;         // Cap to prevent unbounded memory growth from spoofed sources
+    static bool deviceLimitWarned = false;
+
     static Dictionary<string, DeviceInfo> devices = new Dictionary<string, DeviceInfo>();
     static Dictionary<string, string> followerToLeaderV1 = new Dictionary<string, string>();
     static Dictionary<string, string> followerToLeaderV2 = new Dictionary<string, string>();
@@ -112,7 +99,7 @@ class Program {
     /// </summary>
     static void Main(string[] args) {
         LoadConfig();
-        Console.WriteLine("=== PTPMonitor v1.6.8 (Final Version) ===");
+        Console.WriteLine("=== PTPMonitor v1.7.0 ===");
         
         NetworkInterface[] nics = NetworkInterface.GetAllNetworkInterfaces();
         List<IPAddress> validIps = new List<IPAddress>();
@@ -144,16 +131,21 @@ class Program {
         if(!string.IsNullOrEmpty(pIn)) WebPort = pIn;
 
         RotateLogFile();
-        Task.Factory.StartNew(WebServerLoop);
-        Task.Factory.StartNew(MonitorLoop);
+        Task.Factory.StartNew(WebServerLoop, cts.Token, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+        Task.Factory.StartNew(MonitorLoop, cts.Token, TaskCreationOptions.LongRunning, TaskScheduler.Default);
 
         var sockets = new List<Socket>();
         foreach (int port in Ports) {
-            var sock = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
-            sock.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
-            sock.ReceiveTimeout = 1000;
-            sock.Bind(new IPEndPoint(currentLocalIp, port));
-            sock.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.AddMembership, new MulticastOption(IPAddress.Parse(McastGroup), currentLocalIp));
+            Socket sock;
+            try {
+                sock = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+                sock.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+                sock.Bind(new IPEndPoint(currentLocalIp, port));
+                sock.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.AddMembership, new MulticastOption(IPAddress.Parse(McastGroup), currentLocalIp));
+            } catch (SocketException ex) {
+                Log(string.Format("[ERROR] Cannot listen on UDP port {0} ({1}). PTP traffic on this port will not be monitored.", port, ex.Message));
+                continue;
+            }
             sockets.Add(sock);
             Task.Factory.StartNew(() => {
                 byte[] buffer = new byte[2048];
@@ -162,9 +154,22 @@ class Program {
                         EndPoint ep = new IPEndPoint(IPAddress.Any, 0);
                         int received = sock.ReceiveFrom(buffer, ref ep);
                         if (received > 0) ParsePacket(((IPEndPoint)ep).Address.ToString(), buffer, received, port);
-                    } catch { }
+                    } catch (SocketException) {
+                        // Blocking receive is aborted by sock.Close() on shutdown; other socket
+                        // errors (e.g. ICMP port-unreachable resets on UDP) are transient.
+                        if (cts.Token.IsCancellationRequested) break;
+                    } catch (ObjectDisposedException) {
+                        break; // Socket closed during shutdown
+                    } catch (Exception ex) {
+                        Log("[ERROR] Packet processing failed: " + ex.Message);
+                    }
                 }
-            });
+            }, cts.Token, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+        }
+
+        if (sockets.Count == 0) {
+            Log("[ERROR] No PTP ports could be opened. Exiting.");
+            return;
         }
 
         Console.WriteLine("\nStarting monitoring on {0}...", currentLocalIp);
@@ -179,9 +184,11 @@ class Program {
                 try {
                     sock.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.DropMembership, new MulticastOption(IPAddress.Parse(McastGroup), currentLocalIp));
                     sock.Close();
-                } catch {}
+                } catch (Exception) { /* Best-effort cleanup during shutdown */ }
             }
-            if(logWriter != null) logWriter.Close();
+            lock(printLock) {
+                if(logWriter != null) { logWriter.Close(); logWriter = null; }
+            }
             Environment.Exit(0);
         };
 
@@ -209,41 +216,63 @@ class Program {
                 foreach (var line in File.ReadAllLines(path)) {
                     if (string.IsNullOrEmpty(line) || line.StartsWith("#")) continue;
                     if (line.StartsWith("[") && line.EndsWith("]")) continue;
-                    var parts = line.Split('=');
+                    var parts = line.Split(new char[] { '=' }, 2); // Limit to 2 so values may contain '='
                     if (parts.Length == 2) {
                         string key = parts[0].Trim();
                         string val = parts[1].Trim();
                         if (key.Equals("OfflineRetentionHours", StringComparison.OrdinalIgnoreCase)) {
-                            double.TryParse(val, out OfflineRetentionHours);
+                            ApplyConfigDouble(key, val, ref OfflineRetentionHours);
                         } else if (key.Equals("ExpectedDelayInterval", StringComparison.OrdinalIgnoreCase)) {
-                            double.TryParse(val, out ExpectedDelayInterval);
+                            ApplyConfigDouble(key, val, ref ExpectedDelayInterval);
                         } else if (key.Equals("DelayAlertThresholdRate", StringComparison.OrdinalIgnoreCase)) {
-                            double.TryParse(val, out DelayAlertThresholdRate);
+                            ApplyConfigDouble(key, val, ref DelayAlertThresholdRate);
                         } else if (key.Equals("OfflineTimeoutSeconds", StringComparison.OrdinalIgnoreCase)) {
-                            double.TryParse(val, out OfflineTimeoutSeconds);
+                            ApplyConfigDouble(key, val, ref OfflineTimeoutSeconds);
                         } else {
                             customVendors[key.ToUpper()] = val;
                         }
                     }
                 }
             }
-        } catch {}
+        } catch (Exception ex) {
+            Console.WriteLine("[WARN] Failed to load config.ini, using default settings: " + ex.Message);
+        }
+    }
+
+    /// <summary>
+    /// Parses a config double invariantly; keeps the current (default) value when the input is invalid.
+    /// </summary>
+    static void ApplyConfigDouble(string key, string val, ref double target) {
+        double parsed;
+        if (double.TryParse(val, NumberStyles.Float, CultureInfo.InvariantCulture, out parsed)) {
+            target = parsed;
+        } else {
+            Console.WriteLine(string.Format("[WARN] config.ini: invalid value for {0} ('{1}'), keeping {2}", key, val, target.ToString(CultureInfo.InvariantCulture)));
+        }
     }
 
     /// <summary>
     /// Rotates log files on startup and when size exceeds the limit.
     /// </summary>
     static void RotateLogFile() {
-        if (logWriter != null) { logWriter.Close(); logWriter = null; }
-        string logDir = "logs";
-        if (!Directory.Exists(logDir)) Directory.CreateDirectory(logDir);
-        string old = currentLogPath;
-        string rotated = Path.Combine(logDir, string.Format("ptp_monitor_{0}.log", DateTime.Now.ToString("yyyyMMdd_HHmmss")));
-        bool moved = false;
-        try { if(File.Exists(old)) { File.Move(old, rotated); moved = true; } } catch {}
-        if (!moved && File.Exists(old)) { try { File.WriteAllText(old, ""); } catch {} }
-        try { logWriter = new StreamWriter(new FileStream(currentLogPath, FileMode.Append, FileAccess.Write, FileShare.ReadWrite)) { AutoFlush = true }; } catch {}
-        if (logWriter != null) logWriter.WriteLine(string.Format("[{0:yyyy-MM-dd HH:mm:ss}] --- Log Session Started ---", DateTime.Now));
+        try {
+            var oldWriter = logWriter;
+            logWriter = null;
+            if (oldWriter != null) oldWriter.Close();
+            string logDir = "logs";
+            if (!Directory.Exists(logDir)) Directory.CreateDirectory(logDir);
+            string old = currentLogPath;
+            string rotated = Path.Combine(logDir, string.Format("ptp_monitor_{0}.log", DateTime.Now.ToString("yyyyMMdd_HHmmss")));
+            bool moved = false;
+            try { if(File.Exists(old)) { File.Move(old, rotated); moved = true; } } catch (Exception) { /* Fall through to truncate below */ }
+            if (!moved && File.Exists(old)) { try { File.WriteAllText(old, ""); } catch (Exception) { /* Log file locked; appending continues */ } }
+            logWriter = new StreamWriter(new FileStream(currentLogPath, FileMode.Append, FileAccess.Write, FileShare.ReadWrite)) { AutoFlush = true };
+            logWriter.WriteLine(string.Format("[{0:yyyy-MM-dd HH:mm:ss}] --- Log Session Started ---", DateTime.Now));
+        } catch (Exception ex) {
+            // File logging is optional: never let rotation failures (permissions, disk full) kill monitoring.
+            logWriter = null;
+            Console.WriteLine("[WARN] Cannot prepare log file '" + currentLogPath + "': " + ex.Message + " (console/Web UI logging only)");
+        }
     }
 
     /// <summary>
@@ -255,7 +284,9 @@ class Program {
         lock(printLock) {
             Console.WriteLine(string.Format("[{0}] {1}", timestamp, message));
             if(logWriter != null) {
-                try { logWriter.WriteLine(clean); if (new FileInfo(currentLogPath).Length > 10 * 1024 * 1024) RotateLogFile(); } catch {}
+                // Swallowed intentionally: logging must never crash monitoring, and
+                // reporting a log-write failure via Log() would recurse.
+                try { logWriter.WriteLine(clean); if (new FileInfo(currentLogPath).Length > 10 * 1024 * 1024) RotateLogFile(); } catch (Exception) {}
             }
         }
         lock(logLock) { logs.Add(clean); if(logs.Count > 500) logs.RemoveAt(0); }
@@ -278,6 +309,17 @@ class Program {
     }
 
     /// <summary>
+    /// Removes a device's topology links, including links of other nodes that point to it as parent.
+    /// Must be called while holding lock(devices).
+    /// </summary>
+    static void RemoveDeviceLinks(string ip) {
+        followerToLeaderV1.Remove(ip);
+        followerToLeaderV2.Remove(ip);
+        foreach (var k in followerToLeaderV1.Where(x => x.Value == ip).Select(x => x.Key).ToList()) followerToLeaderV1.Remove(k);
+        foreach (var k in followerToLeaderV2.Where(x => x.Value == ip).Select(x => x.Key).ToList()) followerToLeaderV2.Remove(k);
+    }
+
+    /// <summary>
     /// Parses received PTP packets and updates device state. Supports PTPv1 and v2.
     /// </summary>
     static void ParsePacket(string ip, byte[] data, int len, int port) {
@@ -290,28 +332,38 @@ class Program {
         string ownId = "";
         string role = "Unknown";
         byte msgType = 0;
+        byte control = 0;
 
         if (protoVer == "v2") {
             msgType = (byte)(data[0] & 0x0F);
             domain = data[4].ToString();
             if (len >= 28) ownId = BitConverter.ToString(data, 20, 8).Replace("-","");
-            role = "Unknown";
             if (msgType == 0 || msgType == 11 || msgType == 8 || msgType == 9) role = "Leader"; // Sync, Announce, Follow_Up, Delay_Resp
-            else if (msgType == 1 || msgType == 2) role = "Follower"; // Delay_Req, Pdelay_Req
-            else if (msgType == 9) role = "Leader"; // Delay_Resp
+            else if (msgType == 1) role = "Follower"; // Delay_Req (Pdelay_Req excluded: P2P leaders send it too)
         } else {
             if (len < 40) return;
-            msgType = data[20]; // PTPv1 messageType is at offset 20
+            // PTPv1 (IEEE 1588-2002): messageType (offset 20) only distinguishes Event(1)/General(2).
+            // The actual message kind is in the control field (offset 32):
+            // 0=Sync, 1=Delay_Req, 2=Follow_Up, 3=Delay_Resp, 4=Management.
+            msgType = data[20];
+            control = data[32];
             domain = Encoding.UTF8.GetString(data, 4, 16).TrimEnd('\0', ' ');
             ownId = BitConverter.ToString(data, 22, 6).Replace("-","");
-            role = "Unknown";
-            byte control = data[32];
-            if (msgType == 0 || control == 0 || control == 2 || control == 3) role = "Leader";
-            else if (msgType == 1 || control == 1) role = "Follower";
+            if (control == 0 || control == 2 || control == 3) role = "Leader"; // Sync, Follow_Up, Delay_Resp
+            else if (control == 1) role = "Follower"; // Delay_Req
         }
 
         lock(devices) {
-            if (!devices.ContainsKey(ip)) devices[ip] = new DeviceInfo(ip);
+            if (!devices.ContainsKey(ip)) {
+                if (devices.Count >= MaxDevices) {
+                    if (!deviceLimitWarned) {
+                        deviceLimitWarned = true;
+                        Log(string.Format("[WARN] Device limit ({0}) reached; additional devices are ignored.", MaxDevices));
+                    }
+                    return;
+                }
+                devices[ip] = new DeviceInfo(ip);
+            }
             var dev = devices[ip];
             dev.LastSeen = DateTime.Now; dev.IsOnline = true;
             if (dev.Mac == "Unknown" && ownId.Length >= 12) {
@@ -323,38 +375,37 @@ class Program {
             if (!dev.Protocols.ContainsKey(protoVer)) dev.Protocols[protoVer] = new ProtocolState();
             var pState = dev.Protocols[protoVer];
             string oldRole = pState.Role;
-            pState.Domain = domain; pState.OwnId = ownId; pState.IsOnline = true;
+            pState.Domain = domain; pState.OwnId = ownId;
             if (role != "Unknown") pState.Role = role;
 
-            if (len >= 34) {
-                sbyte logInt = unchecked((sbyte)data[33]);
+            if (protoVer == "v2") {
+                sbyte logInt = unchecked((sbyte)data[33]); // v2 header: logMessageInterval
                 if (logInt != 0x7F) {
-                    if (protoVer == "v2") {
-                        if (msgType == 0) pState.SyncLog = logInt;
-                        else if (msgType == 11) pState.AnnounceLog = logInt;
-                    } else if (protoVer == "v1") {
-                        if (msgType == 0) {
-                            pState.SyncLog = logInt;
-                            if (len >= 61) {
-                                string v1GmId = BitConverter.ToString(data, 55, 6).Replace("-","");
-                                if (pState.GrandmasterId != null && pState.GrandmasterId != v1GmId) Log(string.Format("[GM_CHANGE] {0} v1 GM -> {1}", ip, v1GmId));
-                                pState.GrandmasterId = v1GmId;
-                            }
-                        }
-                    }
+                    if (msgType == 0) pState.SyncLog = logInt;
+                    else if (msgType == 11) pState.AnnounceLog = logInt;
+                }
+            } else if (control == 0) { // v1 Sync message body
+                if (len >= 84) {
+                    sbyte syncInterval = unchecked((sbyte)data[83]); // v1 Sync body: syncInterval (offset 83)
+                    if (syncInterval != 0x7F) pState.SyncLog = syncInterval;
+                }
+                if (len >= 60) {
+                    string v1GmId = BitConverter.ToString(data, 54, 6).Replace("-",""); // grandmasterClockUuid (offset 54)
+                    if (pState.GrandmasterId != null && pState.GrandmasterId != v1GmId) Log(string.Format("[GM_CHANGE] {0} v1 GM -> {1}", ip, v1GmId));
+                    pState.GrandmasterId = v1GmId;
                 }
             }
 
             // Accurate Topology Linking via Delay_Resp
             if (protoVer == "v2" && msgType == 9 && len >= 52) { // v2 Delay_Resp
                 string reqId = BitConverter.ToString(data, 44, 8).Replace("-","");
-                foreach(var d in devices.Values) { 
-                    if (d.Protocols.ContainsKey("v2") && d.Protocols["v2"].OwnId == reqId) followerToLeaderV2[d.IP] = ip; 
+                foreach(var d in devices.Values) {
+                    if (d.Protocols.ContainsKey("v2") && d.Protocols["v2"].OwnId == reqId) followerToLeaderV2[d.IP] = ip;
                 }
-            } else if (protoVer == "v1" && msgType == 3 && len >= 54) { // v1 Delay_Resp
-                string reqId = BitConverter.ToString(data, 48, 6).Replace("-","");
-                foreach(var d in devices.Values) { 
-                    if (d.Protocols.ContainsKey("v1") && d.Protocols["v1"].OwnId == reqId) followerToLeaderV1[d.IP] = ip; 
+            } else if (protoVer == "v1" && control == 3 && len >= 56) { // v1 Delay_Resp
+                string reqId = BitConverter.ToString(data, 50, 6).Replace("-",""); // requestingSourceUuid (offset 50)
+                foreach(var d in devices.Values) {
+                    if (d.Protocols.ContainsKey("v1") && d.Protocols["v1"].OwnId == reqId) followerToLeaderV1[d.IP] = ip;
                 }
             }
 
@@ -419,7 +470,7 @@ class Program {
             }
 
 
-            if (role == "Follower" && (msgType == 1 || (protoVer == "v1" && data[20] == 1))) {
+            if (role == "Follower" && ((protoVer == "v2" && msgType == 1) || (protoVer == "v1" && control == 1))) { // Delay_Req
                 if (pState.LastDelayReqSeen.HasValue) {
                     pState.LastMeasuredIntervalMs = (DateTime.Now - pState.LastDelayReqSeen.Value).TotalMilliseconds;
                 }
@@ -446,8 +497,7 @@ class Program {
                 }
                 foreach(var k in toRemove) {
                     Log("[LEAVE] " + devices[k].IP + " (Retention expired)");
-                    followerToLeaderV1.Remove(k);
-                    followerToLeaderV2.Remove(k);
+                    RemoveDeviceLinks(k);
                     devices.Remove(k);
                 }
             }
@@ -461,79 +511,159 @@ class Program {
     static void WebServerLoop() {
         httpListener.Prefixes.Add("http://localhost:" + WebPort + "/");
         httpListener.Prefixes.Add("http://127.0.0.1:" + WebPort + "/");
-        try { httpListener.Start(); } catch { return; }
-        while(httpListener.IsListening) {
-            try { var context = httpListener.GetContext(); ProcessRequest(context); } catch { }
+        try {
+            httpListener.Start();
+        } catch (Exception ex) {
+            Log(string.Format("[ERROR] Web server failed to start on port {0}: {1} (Is the port already in use?)", WebPort, ex.Message));
+            return;
         }
+        int consecutiveFailures = 0;
+        while(httpListener.IsListening && !cts.Token.IsCancellationRequested) {
+            HttpListenerContext context;
+            try {
+                context = httpListener.GetContext();
+                consecutiveFailures = 0;
+            } catch (Exception ex) {
+                if (!httpListener.IsListening || cts.Token.IsCancellationRequested) break;
+                if (++consecutiveFailures >= 5) {
+                    Log("[ERROR] Web server stopped after repeated accept failures: " + ex.Message);
+                    break;
+                }
+                continue;
+            }
+            // Dispatch to the thread pool so one slow client cannot block other requests
+            Task.Factory.StartNew(() => ProcessRequest(context));
+        }
+    }
+
+    /// <summary>
+    /// Escapes a string as a JSON string literal (quotes, backslashes, and control characters).
+    /// </summary>
+    static string JsonStr(string s) {
+        if (s == null) return "\"\"";
+        var sb = new StringBuilder(s.Length + 2);
+        sb.Append('"');
+        foreach (char c in s) {
+            switch (c) {
+                case '"': sb.Append("\\\""); break;
+                case '\\': sb.Append("\\\\"); break;
+                case '\b': sb.Append("\\b"); break;
+                case '\f': sb.Append("\\f"); break;
+                case '\n': sb.Append("\\n"); break;
+                case '\r': sb.Append("\\r"); break;
+                case '\t': sb.Append("\\t"); break;
+                default:
+                    if (c < 0x20) sb.Append("\\u").Append(((int)c).ToString("x4", CultureInfo.InvariantCulture));
+                    else sb.Append(c);
+                    break;
+            }
+        }
+        sb.Append('"');
+        return sb.ToString();
+    }
+
+    /// <summary>
+    /// Formats a double as a JSON number, independent of the OS locale (decimal point is always '.').
+    /// </summary>
+    static string JsonNum(double d) {
+        if (double.IsNaN(d) || double.IsInfinity(d)) return "null";
+        return d.ToString("R", CultureInfo.InvariantCulture);
     }
 
     /// <summary>
     /// Processes HTTP requests and returns API data (JSON) or HTML content.
     /// </summary>
     static void ProcessRequest(HttpListenerContext context) {
-        var res = context.Response; string path = context.Request.Url.AbsolutePath;
-        
-        if (path == "/api/clear_offline" && context.Request.HttpMethod == "POST") {
-            int count = 0;
-            lock(devices) {
-                var toRemove = devices.Where(x => !x.Value.IsOnline).Select(x => x.Key).ToList();
-                count = toRemove.Count;
-                foreach(var k in toRemove) {
-                    followerToLeaderV1.Remove(k);
-                    followerToLeaderV2.Remove(k);
-                    devices.Remove(k);
-                }
-            }
-            Log(string.Format("[SYSTEM] Offline devices cleared by WebUI ({0} nodes).", count));
-            res.StatusCode = 200; res.Close(); return;
-        } else if (path == "/api/clear_all" && context.Request.HttpMethod == "POST") {
-            lock(devices) { devices.Clear(); followerToLeaderV1.Clear(); followerToLeaderV2.Clear(); }
-            lock(logLock) { logs.Clear(); }
-            Log("[SYSTEM] Network state and logs cleared by WebUI.");
-            res.StatusCode = 200; res.Close(); return;
-        } else if (path == "/api/data") {
-            var sb = new StringBuilder(); sb.Append("{\"expectedDelayInterval\":"+ExpectedDelayInterval+",\"delayAlertThresholdRate\":"+DelayAlertThresholdRate+",");
-            lock(devices) {
-                sb.Append("\"devices\":["); bool f = true;
-                foreach(var dev in devices.Values) {
-                    if(!f) sb.Append(","); f = false;
-                    sb.Append("{\"ip\":\""+dev.IP+"\",\"mac\":\""+dev.Mac+"\",\"online\":"+(dev.IsOnline?"true":"false")+",");
-                    sb.Append("\"idleSeconds\":"+(int)(DateTime.Now-dev.LastSeen).TotalSeconds+",");
-                    sb.Append("\"uptimeSeconds\":"+(int)(DateTime.Now-dev.FirstSeen).TotalSeconds+",");
-                    sb.Append("\"protocols\":{"); bool fp = true;
-                    foreach(var p in dev.Protocols) {
-                        if(!fp) sb.Append(","); fp = false;
-                        string pip = "";
-                        if (p.Key == "v1" && followerToLeaderV1.ContainsKey(dev.IP)) pip = followerToLeaderV1[dev.IP];
-                        if (p.Key == "v2" && followerToLeaderV2.ContainsKey(dev.IP)) pip = followerToLeaderV2[dev.IP];
-                        sb.Append("\""+p.Key+"\":{\"role\":\""+p.Value.Role+"\",\"domain\":\""+p.Value.Domain+"\",\"ownId\":\""+(p.Value.OwnId??"")+"\",");
-                        sb.Append("\"syncLog\":"+(p.Value.SyncLog.HasValue ? p.Value.SyncLog.Value.ToString() : "null")+",\"announceLog\":"+(p.Value.AnnounceLog.HasValue ? p.Value.AnnounceLog.Value.ToString() : "null")+",");
-                        sb.Append("\"gmId\":\""+(p.Value.GrandmasterId??"")+"\",\"vendor\":\""+GetVendorSafe(dev.Mac)+"\",");
-                         sb.Append("\"isConflict\":"+(p.Value.IsConflict?"true":"false")+",");
-                         sb.Append("\"conflictSeconds\":"+(p.Value.ConflictStartedAt.HasValue?(int)(DateTime.Now-p.Value.ConflictStartedAt.Value).TotalSeconds:0)+",");
-                         sb.Append("\"lastMeasuredIntervalMs\":"+(p.Value.LastMeasuredIntervalMs.HasValue?((int)p.Value.LastMeasuredIntervalMs.Value).ToString():"null")+",");
-                         sb.Append("\"parentIp\":\""+pip+"\",");
-                        sb.Append("\"roleElapsedSeconds\":"+(p.Value.RoleChangedAt.HasValue?(int)(DateTime.Now-p.Value.RoleChangedAt.Value).TotalSeconds:-1)+"}");
+        var res = context.Response;
+        try {
+            string path = context.Request.Url.AbsolutePath;
+
+            if (path == "/api/clear_offline" && context.Request.HttpMethod == "POST") {
+                int count = 0;
+                lock(devices) {
+                    var toRemove = devices.Where(x => !x.Value.IsOnline).Select(x => x.Key).ToList();
+                    count = toRemove.Count;
+                    foreach(var k in toRemove) {
+                        RemoveDeviceLinks(k);
+                        devices.Remove(k);
                     }
-                    sb.Append("}}");
                 }
-                sb.Append("],\"logs\":["); lock(logLock) {
-                    for(int i=0; i<logs.Count; i++) sb.Append((i>0?",":"")+"\""+logs[i].Replace("\"","\\\"")+"\"");
-                } sb.Append("]}");
+                Log(string.Format("[SYSTEM] Offline devices cleared by WebUI ({0} nodes).", count));
+                res.StatusCode = 200;
+            } else if (path == "/api/clear_all" && context.Request.HttpMethod == "POST") {
+                lock(devices) { devices.Clear(); followerToLeaderV1.Clear(); followerToLeaderV2.Clear(); }
+                lock(logLock) { logs.Clear(); }
+                Log("[SYSTEM] Network state and logs cleared by WebUI.");
+                res.StatusCode = 200;
+            } else if (path == "/api/data") {
+                var sb = new StringBuilder();
+                sb.Append("{\"expectedDelayInterval\":").Append(JsonNum(ExpectedDelayInterval));
+                sb.Append(",\"delayAlertThresholdRate\":").Append(JsonNum(DelayAlertThresholdRate)).Append(",");
+                lock(devices) {
+                    sb.Append("\"devices\":["); bool f = true;
+                    foreach(var dev in devices.Values) {
+                        if(!f) sb.Append(","); f = false;
+                        sb.Append("{\"ip\":").Append(JsonStr(dev.IP)).Append(",\"mac\":").Append(JsonStr(dev.Mac));
+                        sb.Append(",\"online\":").Append(dev.IsOnline?"true":"false").Append(",");
+                        sb.Append("\"idleSeconds\":").Append((int)(DateTime.Now-dev.LastSeen).TotalSeconds).Append(",");
+                        sb.Append("\"uptimeSeconds\":").Append((int)(DateTime.Now-dev.FirstSeen).TotalSeconds).Append(",");
+                        sb.Append("\"protocols\":{"); bool fp = true;
+                        foreach(var p in dev.Protocols) {
+                            if(!fp) sb.Append(","); fp = false;
+                            string pip = "";
+                            if (p.Key == "v1" && followerToLeaderV1.ContainsKey(dev.IP)) pip = followerToLeaderV1[dev.IP];
+                            if (p.Key == "v2" && followerToLeaderV2.ContainsKey(dev.IP)) pip = followerToLeaderV2[dev.IP];
+                            sb.Append(JsonStr(p.Key)).Append(":{\"role\":").Append(JsonStr(p.Value.Role));
+                            sb.Append(",\"domain\":").Append(JsonStr(p.Value.Domain));
+                            sb.Append(",\"ownId\":").Append(JsonStr(p.Value.OwnId ?? "")).Append(",");
+                            sb.Append("\"syncLog\":").Append(p.Value.SyncLog.HasValue ? p.Value.SyncLog.Value.ToString() : "null");
+                            sb.Append(",\"announceLog\":").Append(p.Value.AnnounceLog.HasValue ? p.Value.AnnounceLog.Value.ToString() : "null").Append(",");
+                            sb.Append("\"gmId\":").Append(JsonStr(p.Value.GrandmasterId ?? ""));
+                            sb.Append(",\"vendor\":").Append(JsonStr(GetVendorSafe(dev.Mac))).Append(",");
+                            sb.Append("\"gmPriority1\":").Append(p.Value.GmPriority1.HasValue ? p.Value.GmPriority1.Value.ToString() : "null").Append(",");
+                            sb.Append("\"gmClass\":").Append(p.Value.GmClass.HasValue ? p.Value.GmClass.Value.ToString() : "null").Append(",");
+                            sb.Append("\"gmPriority2\":").Append(p.Value.GmPriority2.HasValue ? p.Value.GmPriority2.Value.ToString() : "null").Append(",");
+                            sb.Append("\"isConflict\":").Append(p.Value.IsConflict?"true":"false").Append(",");
+                            sb.Append("\"conflictSeconds\":").Append(p.Value.ConflictStartedAt.HasValue?(int)(DateTime.Now-p.Value.ConflictStartedAt.Value).TotalSeconds:0).Append(",");
+                            sb.Append("\"lastMeasuredIntervalMs\":").Append(p.Value.LastMeasuredIntervalMs.HasValue?((int)p.Value.LastMeasuredIntervalMs.Value).ToString():"null").Append(",");
+                            sb.Append("\"parentIp\":").Append(JsonStr(pip)).Append(",");
+                            sb.Append("\"roleElapsedSeconds\":").Append(p.Value.RoleChangedAt.HasValue?(int)(DateTime.Now-p.Value.RoleChangedAt.Value).TotalSeconds:-1).Append("}");
+                        }
+                        sb.Append("}}");
+                    }
+                    sb.Append("],\"logs\":[");
+                    lock(logLock) {
+                        for(int i=0; i<logs.Count; i++) { if(i>0) sb.Append(","); sb.Append(JsonStr(logs[i])); }
+                    }
+                    sb.Append("]}");
+                }
+                byte[] b = Encoding.UTF8.GetBytes(sb.ToString());
+                res.ContentType = "application/json";
+                res.ContentLength64 = b.Length;
+                res.OutputStream.Write(b,0,b.Length);
+            } else {
+                byte[] b = Encoding.UTF8.GetBytes(HtmlContent.Replace("{PORT}", WebPort));
+                res.ContentType = "text/html; charset=utf-8";
+                res.ContentLength64 = b.Length;
+                res.OutputStream.Write(b,0,b.Length);
             }
-            byte[] b = Encoding.UTF8.GetBytes(sb.ToString()); res.ContentType="application/json"; res.ContentLength64=b.Length; res.OutputStream.Write(b,0,b.Length);
-        } else {
-            byte[] b = Encoding.UTF8.GetBytes(HtmlContent.Replace("{PORT}", WebPort)); res.OutputStream.Write(b,0,b.Length);
+        } catch (HttpListenerException) {
+            // Client disconnected mid-response (reload / tab closed): abort quietly.
+        } catch (IOException) {
+            // Broken connection while writing: abort quietly.
+        } catch (Exception ex) {
+            Log("[ERROR] Web request handling failed: " + ex.Message);
+        } finally {
+            try { res.Close(); } catch (Exception) { /* Response already aborted */ }
         }
-        res.Close();
     }
 
-    static readonly string HtmlHeader = @"<!DOCTYPE html><html><head><meta charset=""UTF-8""><title>PTPMonitor v1.6.8</title>
-<link href=""https://fonts.googleapis.com/css2?family=Inter:wght@400;600&family=Outfit:wght@700&display=swap"" rel=""stylesheet"">";
+    // No external font/CDN references: the dashboard must render fully offline (production networks are often isolated).
+    static readonly string HtmlHeader = @"<!DOCTYPE html><html><head><meta charset=""UTF-8""><title>PTPMonitor v1.7.0</title>";
 
     static readonly string HtmlStyle = @"<style>
 :root{--bg:#0b0f19;--glass:rgba(255,255,255,0.03);--border:rgba(255,255,255,0.08);--accent:#00d2ff;--leader:#ff7090;--follower:#5de8b8;--offline:#4a5568;}
-body{margin:0;padding:1.5rem;background:var(--bg);color:#e2e8f0;font-family:'Inter',sans-serif;}
+body{margin:0;padding:1.5rem;background:var(--bg);color:#e2e8f0;font-family:'Segoe UI','Helvetica Neue',Arial,sans-serif;}
 .container{max-width:1400px;margin:0 auto;}
 header{display:flex;justify-content:space-between;align-items:center;margin-bottom:1.5rem;}
 .grid{display:grid;grid-template-columns:1fr 1fr;gap:1.5rem;margin-bottom:1.5rem;}
@@ -564,7 +694,7 @@ button:hover{border-color:var(--accent);}
     static readonly string HtmlBody = @"</head><body><div class=""container"">
 <header>
     <div>
-        <h1 style=""margin:0"">PTP Monitor <small style=""font-size:0.5em;opacity:0.5"">v1.6.8</small></h1>
+        <h1 style=""margin:0"">PTP Monitor <small style=""font-size:0.5em;opacity:0.5"">v1.7.0</small></h1>
         <div class=""live-indicator"" style=""margin-top:8px"">
             <span class=""dot""></span>
             <span>LIVE MONITORING</span>
@@ -573,8 +703,8 @@ button:hover{border-color:var(--accent);}
         </div>
     </div>
     <div class=""header-actions"">
-        <button onclick=""if(confirm('Reset all network data and logs?')) { fetch('/api/clear_all',{method:'POST'}); fetchUI(); }"">\u21BB Network Clear</button>
-        <button onclick=""if(confirm('Clear all offline devices from the list?')) { fetch('/api/clear_offline',{method:'POST'}); fetchUI(); }"">\U0001F5D1 Clear Offline</button>
+        <button onclick=""if(confirm('Reset all network data and logs?')) { fetch('/api/clear_all',{method:'POST'}).then(fetchUI); }"">" + "\u21BB" + @" Network Clear</button>
+        <button onclick=""if(confirm('Clear all offline devices from the list?')) { fetch('/api/clear_offline',{method:'POST'}).then(fetchUI); }"">" + "\U0001F5D1" + @" Clear Offline</button>
         <button onclick=""exportCSV()"">" + "\u2B07" + @" Export CSV</button>
     </div>
 </header>
@@ -594,22 +724,21 @@ function hhmmss(s) { if(s<0)return'00:00:00'; let h=Math.floor(s/3600),m=Math.fl
 async function fetchUI() {
     try {
         const r = await fetch('/api/data'); const d = await r.json();
-        const counts = { nodes: 0, leaders: 0, bcs: 0, followers: 0, conflicts: 0, v1f: 0, v2f: 0 };
-        
+        const counts = { nodes: 0, leaders: 0, bcs: 0, conflicts: 0, v1f: 0, v2f: 0 };
+
         d.devices.forEach(dev => {
             if(!dev.online) return;
             counts.nodes++;
-            let isL = false; let isF = false;
+            let isL = false;
             const domains = new Set();
-            Object.values(dev.protocols).forEach(p => { 
-                if(p.role==='Leader') isL=true; 
-                if(p.role==='Follower') { isF=true; if(dev.protocols.v1) counts.v1f++; else counts.v2f++; }
-                if(p.isConflict) counts.conflicts++; 
+            Object.entries(dev.protocols).forEach(([ver, p]) => {
+                if(p.role==='Leader') isL=true;
+                if(p.role==='Follower') { if(ver==='v1') counts.v1f++; else counts.v2f++; }
+                if(p.isConflict) counts.conflicts++;
                 if(p.role !== 'Unknown') domains.add(p.domain);
             });
             if(isL) counts.leaders++;
             if((dev.protocols.v1 && dev.protocols.v2) || domains.size > 1) { dev.isBc = true; counts.bcs++; }
-            if(isF) counts.followers++;
         });
 
         const stats = [['Active Nodes', counts.nodes], ['Leaders', counts.leaders], ['v1/v2 Followers', `${counts.v1f}/${counts.v2f}`], ['Boundary Clocks (bc)', counts.bcs], ['Conflicts', counts.conflicts]];
@@ -627,7 +756,7 @@ async function fetchUI() {
                 </div>`;
 
                 const domainNodes = d.devices.filter(dev => dev.protocols[v] && dev.protocols[v].domain === dom);
-                const cmap = {}; const roots = [];
+                const cmap = {}; const roots = []; const rendered = new Set();
 
                 domainNodes.forEach(dev => {
                     const p = dev.protocols[v];
@@ -637,6 +766,8 @@ async function fetchUI() {
                 });
 
                 function render(dev, depth, parentGmId) {
+                    if (rendered.has(dev.ip)) return ''; // Guard against circular parent links
+                    rendered.add(dev.ip);
                     const p = dev.protocols[v];
                     const role = p.role.toLowerCase();
                     const isMismatch = (role === 'follower' && parentGmId && p.gmId && p.gmId !== parentGmId);
@@ -650,6 +781,7 @@ async function fetchUI() {
                     let gmStyle = isMismatch ? 'color:#ff4a4a;font-weight:bold;background:rgba(255,50,50,0.1);padding:2px 4px;border-radius:4px;' : 'opacity:0.9;';
                     let gmLine = `<div class=""info-row"" style=""${gmStyle}margin-top:6px;font-family:monospace;"">GM: ${esc(gmIdText)}${isMismatch?' <span style=""margin-left:4px;"">\u26A0 GM Mismatch!</span>':''}</div>`;
                     let logLine = (role === 'leader' && v === 'v2') ? `<div class=""info-row"" style=""opacity:0.7"">Sync: ${valS(p.syncLog)} / Announce: ${valS(p.announceLog)}</div>` : '';
+                    let bmcLine = (role === 'leader' && v === 'v2' && p.gmPriority1 !== null) ? `<div class=""info-row"" style=""opacity:0.7"">BMC: P1=${valS(p.gmPriority1)} / Class=${valS(p.gmClass)} / P2=${valS(p.gmPriority2)}</div>` : '';
                     
                     let badgeText = esc(p.role);
                     if (isConflict === 'bmca') badgeText = 'BMCA (Negotiating)';
@@ -670,6 +802,7 @@ async function fetchUI() {
                         </div>
                         ${gmLine}
                         ${logLine}
+                        ${bmcLine}
                     </div>`;
                     (cmap[dev.ip] || []).forEach(c => res += render(c, depth + 1, p.gmId));
                     return res;
@@ -677,13 +810,27 @@ async function fetchUI() {
 
                 let domainHtml = '';
                 roots.forEach(r => domainHtml += render(r, 0, null));
+                // Orphans (unreachable via roots, e.g. circular parent refs after a leader loss) still get shown
+                domainNodes.forEach(dev => { if (!rendered.has(dev.ip)) domainHtml += render(dev, 0, null); });
                 html += domainHtml || '<div style=""padding:1rem;color:#666;font-size:0.8rem"">No nodes in this domain</div>';
             });
             document.getElementById(v).innerHTML = html || '<div style=""padding:2rem;text-align:center;color:#666"">No PTP data detected</div>';
         });
         document.getElementById('l').innerHTML = d.logs.map(log=>`<div>${esc(log)}</div>`).reverse().join('');
     } catch(e) { console.error(e); }
-    setTimeout(fetchUI, 2000);
+}
+
+// Periodic polling lives ONLY here; button handlers call fetchUI() directly for a
+// one-shot refresh so clicking cannot spawn additional polling loops.
+async function pollLoop() {
+    await fetchUI();
+    setTimeout(pollLoop, 2000);
+}
+
+function csvEsc(v) {
+    let s = String(v === null || v === undefined ? '' : v).replace(/""/g, '""""');
+    if (/^[=+\-@]/.test(s)) s = ""'"" + s; // Neutralize spreadsheet formula injection
+    return '""' + s + '""';
 }
 
 function exportCSV(){
@@ -691,7 +838,8 @@ function exportCSV(){
         let csv = 'IP,MAC,Vendor,Online,v1_Role,v1_Domain,v2_Role,v2_Domain,Uptime,Idle\n';
         d.devices.forEach(dev => {
             const v1 = dev.protocols.v1 || {}; const v2 = dev.protocols.v2 || {};
-            csv += `""${dev.ip}"",""${dev.mac}"",""${v1.vendor||v2.vendor||'-'}"",${dev.online},""${v1.role||'-'}"",""${v1.domain||'-'}"",""${v2.role||'-'}"",""${v2.domain||'-'}"",${hhmmss(dev.uptimeSeconds)},${hhmmss(dev.idleSeconds)}\n`;
+            const cols = [dev.ip, dev.mac, v1.vendor||v2.vendor||'-', dev.online, v1.role||'-', v1.domain||'-', v2.role||'-', v2.domain||'-', hhmmss(dev.uptimeSeconds), hhmmss(dev.idleSeconds)];
+            csv += cols.map(csvEsc).join(',') + '\n';
         });
         const blob = new Blob([csv], { type: 'text/csv' });
         const url = window.URL.createObjectURL(blob);
@@ -700,7 +848,7 @@ function exportCSV(){
         document.body.appendChild(a); a.click(); window.URL.revokeObjectURL(url);
     });
 }
-fetchUI();
+pollLoop();
 </script></body></html>";
 
     static readonly string HtmlContent = HtmlHeader + HtmlStyle + HtmlBody + HtmlScripts;

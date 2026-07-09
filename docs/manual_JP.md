@@ -1,4 +1,4 @@
-# PTPMonitor 使用説明書 (v1.6.8)
+# PTPMonitor 使用説明書 (v1.7.0)
 
 PTPMonitor は、ネットワーク上の PTP (Precision Time Protocol) v1 / v2 通信をキャプチャし、デバイスの稼働状況や Boundary Clock (BC) の動作、トポロジーを可視化・診断する「運用特化型プロトコルアナライザー」です。
 
@@ -28,7 +28,10 @@ Follower が親（Leader/BC）と異なる Grandmaster ID を受信している�
 v1/v2 変換動作、同一プロトコル内での複数ドメイン間のブリッジ動作、および `via Upstream` 表記による中継状態を自動判別します。
 
 ### 5. 高精度 GM 識別
-PTPv2 の Announce パケットに加え、PTPv1 (Dante 等) の Sync パケットからも `grandmasterClockId` を正しく抽出し、真の GM を特定します。
+PTPv2 の Announce パケットに加え、PTPv1 (Dante 等) の Sync パケットからも `grandmasterClockUuid` を正しく抽出し、真の GM を特定します。
+
+### 6. BMC (Best Master Clock) 情報表示
+PTPv2 の Leader ノードには、Announce パケットから取得した BMC アルゴリズムの判定要素（`Priority1` / `ClockClass` / `Priority2`）を `BMC: P1=... / Class=... / P2=...` として表示します。GM 選出の優先順位確認に利用できます。
 
 ## WebUI の操作
 - **Uptime / Offline**: 各デバイスの直近の稼働時間、または切断後の経過時間をリアルタイム表示します。
@@ -49,3 +52,6 @@ PTPv2 の Announce パケットに加え、PTPv1 (Dante 等) の Sync パケッ�
 - **OfflineTimeoutSeconds**: オフライン判定までの無通信時間（デフォルト 10.0秒）。
 - **OUI Vendor Mapping**: MACアドレスの先頭（OUI）に基づくベンダー名の定義。
 - **Specific Device Mapping**: 特定のMACアドレスに対して、ホスト名や機器名を個別に割り当て可能。
+
+> [!NOTE]
+> 数値設定に不正な値（数値として解釈できない文字列など）を記述した場合、その項目は無視され、既定値が維持されます（起動時のコンソールに `[WARN]` として通知されます）。数値の小数点は地域設定に関わらずピリオド（`.`）で記述してください。

@@ -1,4 +1,4 @@
-# PTPMonitor User Manual (v1.6.8)
+# PTPMonitor User Manual (v1.7.0)
 
 PTPMonitor is a specialized protocol analyzer designed to capture PTP (Precision Time Protocol) v1 / v2 traffic, visualize device status, Boundary Clock (BC) operations, and network topology for high-precision diagnostic purposes.
 
@@ -28,7 +28,10 @@ If a Follower receives a Grandmaster ID different from what its parent (Leader/B
 Automatically identifies v1/v2 translation, bridge operations across multiple domains within the same protocol, and relay status via `via Upstream` notation.
 
 ### 5. Precision GM Identification
-Correctly identifies true GMs by extracting `grandmasterClockId` from PTPv2 Announce packets as well as PTPv1 (e.g., Dante) Sync packets.
+Correctly identifies true GMs by extracting `grandmasterClockUuid` from PTPv2 Announce packets as well as PTPv1 (e.g., Dante) Sync packets.
+
+### 6. BMC (Best Master Clock) Information Display
+For PTPv2 Leader nodes, the BMC algorithm decision factors (`Priority1` / `ClockClass` / `Priority2`) taken from Announce packets are displayed as `BMC: P1=... / Class=... / P2=...`, which helps verify GM election priorities.
 
 ## WebUI Operations
 - **Uptime / Offline**: Real-time display of uptime for active devices or elapsed time since disconnection for offline devices.
@@ -49,3 +52,6 @@ Correctly identifies true GMs by extracting `grandmasterClockId` from PTPv2 Anno
 - **OfflineTimeoutSeconds**: Seconds of inactivity before a node is marked as offline (default 10.0s).
 - **OUI Vendor Mapping**: Vendor name definitions based on MAC address prefix (OUI).
 - **Specific Device Mapping**: Manually assign names or hostnames to specific MAC addresses.
+
+> [!NOTE]
+> If a numeric setting contains an invalid value (e.g., a non-numeric string), that entry is ignored and the default value is kept (a `[WARN]` message is printed to the console on startup). Always use a period (`.`) as the decimal separator regardless of your OS locale.

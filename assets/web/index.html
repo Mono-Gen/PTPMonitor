@@ -1,0 +1,42 @@
+<!DOCTYPE html><html><head><meta charset="UTF-8"><title>PTPMonitor v1.8.0</title>
+<style>__STYLE_PLACEHOLDER__</style>
+</head><body><div class="container">
+<header>
+    <div>
+        <h1 style="margin:0">PTP Monitor <small style="font-size:0.5em;opacity:0.5">v1.8.0</small></h1>
+        <div class="live-indicator" style="margin-top:8px">
+            <span class="dot"></span>
+            <span>LIVE MONITORING</span>
+            <span style="margin-left:8px;opacity:0.6">|</span>
+            <span id="last-update" style="margin-left:8px">Waiting for data...</span>
+        </div>
+    </div>
+    <div class="header-actions">
+        <button onclick="if(confirm('Reset all network data and logs?')) { fetch('/api/clear_all',{method:'POST'}).then(fetchUI); }">↻ Network Clear</button>
+        <button onclick="if(confirm('Clear all offline devices from the list?')) { fetch('/api/clear_offline',{method:'POST'}).then(fetchUI); }">🗑 Clear Offline</button>
+        <button onclick="exportCSV()">⬇ Export CSV</button>
+    </div>
+</header>
+<div id="alertBanner"></div>
+<div class="toolbar">
+    <input type="text" id="searchBox" class="search-input" placeholder="Search IP / MAC / Vendor..." oninput="applySearchFilter()">
+</div>
+<div class="dashboard" id="dash"></div>
+<div class="grid">
+<div class="glass"><h3>📡 v1 Topology</h3><div id="v1"></div></div>
+<div class="glass"><h3>📡 v2 Topology</h3><div id="v2"></div></div>
+</div>
+<div class="glass">
+    <h3>Event Logs</h3>
+    <div class="log-filters" id="logFilters">
+        <button data-level="ALL" class="active" onclick="setLogFilter('ALL')">ALL</button>
+        <button data-level="ERROR" onclick="setLogFilter('ERROR')">ERROR</button>
+        <button data-level="WARN" onclick="setLogFilter('WARN')">WARN</button>
+        <button data-level="CONFLICT" onclick="setLogFilter('CONFLICT')">CONFLICT</button>
+        <button data-level="MISMATCH" onclick="setLogFilter('MISMATCH')">MISMATCH</button>
+    </div>
+    <div id="l" class="logs"></div>
+</div>
+</div>
+<script>__SCRIPT_PLACEHOLDER__</script>
+</body></html>

@@ -1,4 +1,4 @@
-# PTPMonitor User Manual (v1.7.0)
+# PTPMonitor User Manual (v1.8.0)
 
 PTPMonitor is a specialized protocol analyzer designed to capture PTP (Precision Time Protocol) v1 / v2 traffic, visualize device status, Boundary Clock (BC) operations, and network topology for high-precision diagnostic purposes.
 
@@ -22,7 +22,7 @@ When multiple Leaders exist in the same domain, the tool determines the severity
 - **CONFLICT (Persistent) [Red]**: Conflict persisting for **10 seconds or more**. Recorded as a configuration error or dual-master fault in the logs (`[CONFLICT_ALERT]`).
 
 ### 3. GM Mismatch Alert (Diagnostic)
-If a Follower receives a Grandmaster ID different from what its parent (Leader/BC) expects, a red alert (`⚠️ GM Mismatch!`) is displayed on the WebUI to notify users of topology issues.
+If a Follower receives a Grandmaster ID different from what its parent (Leader/BC) expects, a red alert (`⚠️ GM Mismatch!`) is displayed on the WebUI to notify users of topology issues. This check only runs once the parent link has been confirmed by a matching `Delay_Resp` (dashed border = unconfirmed, GM not yet verifiable); an unconfirmed Follower's inherited GM is labeled `(inherited, unverified)` instead.
 
 ### 4. Boundary Clock (BC) Identification
 Automatically identifies v1/v2 translation, bridge operations across multiple domains within the same protocol, and relay status via `via Upstream` notation.
@@ -34,7 +34,10 @@ Correctly identifies true GMs by extracting `grandmasterClockUuid` from PTPv2 An
 For PTPv2 Leader nodes, the BMC algorithm decision factors (`Priority1` / `ClockClass` / `Priority2`) taken from Announce packets are displayed as `BMC: P1=... / Class=... / P2=...`, which helps verify GM election priorities.
 
 ## WebUI Operations
-- **Uptime / Offline**: Real-time display of uptime for active devices or elapsed time since disconnection for offline devices.
+- **Uptime / Offline**: Real-time display of uptime for active devices or elapsed time since disconnection for offline devices. Uptime resets (and a `[REJOIN]` log entry is added) when a device comes back online after being offline.
+- **Search / Filter**: The search box at the top filters visible nodes by IP, MAC, or vendor as you type.
+- **Alert Banner**: A banner above the topology view lists all active Conflict/GM Mismatch alerts; clicking an entry scrolls to and highlights the corresponding node.
+- **Log Level Filters**: The Event Logs panel can be filtered to `ALL` / `ERROR` / `WARN` / `CONFLICT` / `MISMATCH` entries only.
 - `🗑 Clear Offline`: Batch delete all offline devices.
 - `↻ Network Clear`: Reset all data (memory and logs) and restart monitoring.
 - **Statistics Panel**: Counts and displays only currently ""online"" devices in the network.

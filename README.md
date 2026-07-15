@@ -18,6 +18,22 @@ Run `PTPMonitor.exe` (requires proper configuration in `config.ini`).
 
 ## Changelog
 
+### [v1.8.0] - 2026-07-15
+#### Fixed
+- **GM Mismatch Detection**: This check previously relied on a value a pure Follower never sets, so it silently never fired; it now runs only once the parent link is `Delay_Resp`-confirmed, and shows `(inherited, unverified)` when the Follower's own GM cannot be independently verified.
+- **Boundary Clock Topology**: Protocol state is now tracked per (PTP version, domain) instead of per version, so a Boundary Clock acting as Leader/Follower on multiple domains of the same PTP version is tracked correctly instead of one role overwriting the other.
+- **Socket Error Handling**: `SocketException`s are classified by `SocketErrorCode` (transient vs. persistent) instead of being retried unconditionally; explicit `SO_RCVBUF` sizing; fixed a socket handle leak on Bind/AddMembership failure.
+- **Input Validation**: `config.ini` numeric values reject NaN/Infinity/out-of-range inputs; PTPv1/v2 packets are validated for message-type/port/control consistency and rejected otherwise; Web UI port input is strictly parsed.
+- **CSV Export**: Formula-injection guard now also strips leading whitespace/control characters before checking for `=+-@`.
+- **Web Server**: `HttpListener` startup failures (e.g., port already bound) no longer silently kill the server; added a 30s response timeout and a simple Origin-based CSRF check on the data-clearing endpoints.
+#### Changed
+- Conflict and GM-mismatch detection moved from a per-packet full scan to a 1Hz periodic evaluation with edge-triggered logging; log rotation is capped at 20 generations.
+- Elapsed-time tracking uses a monotonic `Stopwatch` tick instead of wall-clock time, so it's unaffected by NTP corrections or manual clock changes.
+- Concurrent HTTP requests are capped (64) to bound resource usage under load.
+- Dashboard HTML/CSS/JS moved from inline C# string constants to `assets/web/*`, embedded via `csc /resource` (keeps the .exe dependency-free while allowing the JS to be lint/syntax-checked independently of the C# build).
+#### Added
+- **Web UI**: device search/filter box, an active-alerts banner (click to scroll to the node), log-level filters (`ERROR`/`WARN`/`CONFLICT`/`MISMATCH`), and a dashed border to visually distinguish unconfirmed topology links.
+
 ### [v1.7.0] - 2026-07-09
 #### Fixed
 - **PTPv1 (Dante) Parsing Overhaul**:

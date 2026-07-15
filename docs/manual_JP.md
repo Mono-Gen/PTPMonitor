@@ -1,4 +1,4 @@
-# PTPMonitor 使用説明書 (v1.7.0)
+# PTPMonitor 使用説明書 (v1.8.0)
 
 PTPMonitor は、ネットワーク上の PTP (Precision Time Protocol) v1 / v2 通信をキャプチャし、デバイスの稼働状況や Boundary Clock (BC) の動作、トポロジーを可視化・診断する「運用特化型プロトコルアナライザー」です。
 
@@ -22,7 +22,7 @@ PTPMonitor は、ネットワーク上の PTP (Precision Time Protocol) v1 / v2 
 - **CONFLICT (Persistent) [赤色]**: 競合が **10秒以上** 継続している状態。ネットワーク上の設定ミスや二重マスター障害としてログ (`[CONFLICT_ALERT]`) に記録されます。
 
 ### 3. GM 不一致アラート (Diagnostic)
-Follower が親（Leader/BC）と異なる Grandmaster ID を受信している場合に、WebUI で赤色警告 (`⚠️ GM Mismatch!`) を出し、トポロジーの乱れを即座に通知します。
+Follower が親（Leader/BC）と異なる Grandmaster ID を受信している場合に、WebUI で赤色警告 (`⚠️ GM Mismatch!`) を出し、トポロジーの乱れを即座に通知します。この判定は `Delay_Resp` で親リンクが確定済みの場合のみ有効です（破線枠 = 未確定リンク）。未確定の Follower が表示する継承GMには `(inherited, unverified)` と付記され、不一致検知はまだ有効でないことを示します。
 
 ### 4. Boundary Clock (BC) 識別
 v1/v2 変換動作、同一プロトコル内での複数ドメイン間のブリッジ動作、および `via Upstream` 表記による中継状態を自動判別します。
@@ -34,7 +34,10 @@ PTPv2 の Announce パケットに加え、PTPv1 (Dante 等) の Sync パケッ�
 PTPv2 の Leader ノードには、Announce パケットから取得した BMC アルゴリズムの判定要素（`Priority1` / `ClockClass` / `Priority2`）を `BMC: P1=... / Class=... / P2=...` として表示します。GM 選出の優先順位確認に利用できます。
 
 ## WebUI の操作
-- **Uptime / Offline**: 各デバイスの直近の稼働時間、または切断後の経過時間をリアルタイム表示します。
+- **Uptime / Offline**: 各デバイスの直近の稼働時間、または切断後の経過時間をリアルタイム表示します。オフラインから復帰するとUptimeがリセットされ、`[REJOIN]` ログが記録されます。
+- **検索/フィルタ**: 画面上部の検索ボックスにIP・MAC・ベンダー名を入力すると、該当するノードのみを絞り込み表示します。
+- **警告バナー**: トポロジー表示の上部に、現在発生中のConflict/GM不一致アラートが一覧表示されます。クリックすると該当ノードまでスクロールします。
+- **ログレベルフィルタ**: イベントログ欄は `ALL` / `ERROR` / `WARN` / `CONFLICT` / `MISMATCH` で絞り込み表示できます。
 - `🗑 Clear Offline`: オフライン機器を一括削除します。
 - `↻ Network Clear`: 全データ（メモリおよびログ）をリセットして監視を再開します。
 - **統計パネル**: ネットワーク内で現在「オンライン」の機器のみをカウントして表示します。

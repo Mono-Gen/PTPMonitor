@@ -128,7 +128,14 @@ class Program {
 
         Console.Write("Enter Web UI Port [Default: 8080]: ");
         string pIn = Console.ReadLine();
-        if(!string.IsNullOrEmpty(pIn)) WebPort = pIn;
+        if (!string.IsNullOrEmpty(pIn)) {
+            int parsedPort;
+            if (int.TryParse(pIn, NumberStyles.None, CultureInfo.InvariantCulture, out parsedPort) && parsedPort >= 1 && parsedPort <= 65535) {
+                WebPort = parsedPort.ToString(CultureInfo.InvariantCulture);
+            } else {
+                Console.WriteLine(string.Format("[WARN] Invalid port '{0}', keeping default {1}.", pIn, WebPort));
+            }
+        }
 
         RotateLogFile();
         Task.Factory.StartNew(WebServerLoop, cts.Token, TaskCreationOptions.LongRunning, TaskScheduler.Default);
@@ -136,28 +143,42 @@ class Program {
 
         var sockets = new List<Socket>();
         foreach (int port in Ports) {
-            Socket sock;
+            Socket sock = null;
             try {
                 sock = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
                 sock.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+                sock.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReceiveBuffer, 1024 * 1024);
                 sock.Bind(new IPEndPoint(currentLocalIp, port));
                 sock.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.AddMembership, new MulticastOption(IPAddress.Parse(McastGroup), currentLocalIp));
             } catch (SocketException ex) {
                 Log(string.Format("[ERROR] Cannot listen on UDP port {0} ({1}). PTP traffic on this port will not be monitored.", port, ex.Message));
+                if (sock != null) { try { sock.Close(); } catch (Exception) { /* Best-effort cleanup */ } }
                 continue;
             }
             sockets.Add(sock);
             Task.Factory.StartNew(() => {
                 byte[] buffer = new byte[2048];
+                int consecutiveErrors = 0;
                 while (!cts.Token.IsCancellationRequested) {
                     try {
                         EndPoint ep = new IPEndPoint(IPAddress.Any, 0);
                         int received = sock.ReceiveFrom(buffer, ref ep);
                         if (received > 0) ParsePacket(((IPEndPoint)ep).Address.ToString(), buffer, received, port);
-                    } catch (SocketException) {
-                        // Blocking receive is aborted by sock.Close() on shutdown; other socket
-                        // errors (e.g. ICMP port-unreachable resets on UDP) are transient.
+                        consecutiveErrors = 0;
+                    } catch (SocketException ex) {
+                        // Blocking receive is aborted by sock.Close() on shutdown. ConnectionReset (ICMP
+                        // port-unreachable) and MessageSize (a datagram larger than our buffer, whose
+                        // excess is simply discarded by the OS) are expected/transient and never impair
+                        // the socket. Anything else (e.g. the NIC going down) counts toward a threshold
+                        // so a truly persistent failure stops the loop instead of busy-looping forever.
                         if (cts.Token.IsCancellationRequested) break;
+                        if (ex.SocketErrorCode == SocketError.ConnectionReset || ex.SocketErrorCode == SocketError.MessageSize) continue;
+                        consecutiveErrors++;
+                        if (consecutiveErrors >= 5) {
+                            Log(string.Format("[ERROR] UDP port {0} receive loop stopped after repeated errors: {1}", port, ex.Message));
+                            break;
+                        }
+                        Thread.Sleep(200);
                     } catch (ObjectDisposedException) {
                         break; // Socket closed during shutdown
                     } catch (Exception ex) {
@@ -221,13 +242,13 @@ class Program {
                         string key = parts[0].Trim();
                         string val = parts[1].Trim();
                         if (key.Equals("OfflineRetentionHours", StringComparison.OrdinalIgnoreCase)) {
-                            ApplyConfigDouble(key, val, ref OfflineRetentionHours);
+                            ApplyConfigDouble(key, val, ref OfflineRetentionHours, 0.0, double.MaxValue);
                         } else if (key.Equals("ExpectedDelayInterval", StringComparison.OrdinalIgnoreCase)) {
-                            ApplyConfigDouble(key, val, ref ExpectedDelayInterval);
+                            ApplyConfigDouble(key, val, ref ExpectedDelayInterval, 0.001, double.MaxValue);
                         } else if (key.Equals("DelayAlertThresholdRate", StringComparison.OrdinalIgnoreCase)) {
-                            ApplyConfigDouble(key, val, ref DelayAlertThresholdRate);
+                            ApplyConfigDouble(key, val, ref DelayAlertThresholdRate, 0.001, double.MaxValue);
                         } else if (key.Equals("OfflineTimeoutSeconds", StringComparison.OrdinalIgnoreCase)) {
-                            ApplyConfigDouble(key, val, ref OfflineTimeoutSeconds);
+                            ApplyConfigDouble(key, val, ref OfflineTimeoutSeconds, 0.001, double.MaxValue);
                         } else {
                             customVendors[key.ToUpper()] = val;
                         }
@@ -240,11 +261,12 @@ class Program {
     }
 
     /// <summary>
-    /// Parses a config double invariantly; keeps the current (default) value when the input is invalid.
+    /// Parses a config double invariantly; keeps the current (default) value when the input is
+    /// invalid, non-finite (NaN/Infinity), or outside [min, max].
     /// </summary>
-    static void ApplyConfigDouble(string key, string val, ref double target) {
+    static void ApplyConfigDouble(string key, string val, ref double target, double min, double max) {
         double parsed;
-        if (double.TryParse(val, NumberStyles.Float, CultureInfo.InvariantCulture, out parsed)) {
+        if (double.TryParse(val, NumberStyles.Float, CultureInfo.InvariantCulture, out parsed) && !double.IsNaN(parsed) && !double.IsInfinity(parsed) && parsed >= min && parsed <= max) {
             target = parsed;
         } else {
             Console.WriteLine(string.Format("[WARN] config.ini: invalid value for {0} ('{1}'), keeping {2}", key, val, target.ToString(CultureInfo.InvariantCulture)));
@@ -509,10 +531,15 @@ class Program {
     /// Loop for starting the Web UI HTTP server and waiting for requests.
     /// </summary>
     static void WebServerLoop() {
-        httpListener.Prefixes.Add("http://localhost:" + WebPort + "/");
-        httpListener.Prefixes.Add("http://127.0.0.1:" + WebPort + "/");
         try {
+            httpListener.Prefixes.Add("http://localhost:" + WebPort + "/");
+            httpListener.Prefixes.Add("http://127.0.0.1:" + WebPort + "/");
             httpListener.Start();
+            // Bound idle/slow connections so a stalled client cannot pin a thread-pool thread forever.
+            var timeout = TimeSpan.FromSeconds(30);
+            httpListener.TimeoutManager.IdleConnection = timeout;
+            httpListener.TimeoutManager.HeaderWait = timeout;
+            httpListener.TimeoutManager.EntityBody = timeout;
         } catch (Exception ex) {
             Log(string.Format("[ERROR] Web server failed to start on port {0}: {1} (Is the port already in use?)", WebPort, ex.Message));
             return;
@@ -571,12 +598,37 @@ class Program {
     }
 
     /// <summary>
+    /// Rejects cross-site requests to state-mutating endpoints. A request with no Origin header
+    /// (typical for same-page same-origin fetch in most browsers) is allowed; a request with an
+    /// Origin that doesn't match this server's own localhost/127.0.0.1 origin is rejected. This is
+    /// a lightweight mitigation, not a full CSRF-token scheme, appropriate for a localhost-only tool.
+    /// </summary>
+    static bool IsSameOriginRequest(HttpListenerRequest req) {
+        string origin = req.Headers["Origin"];
+        if (string.IsNullOrEmpty(origin)) return true;
+        Uri originUri;
+        // Parse rather than string-compare: a browser omits the port from the Origin header when it
+        // is the scheme's default (e.g. "http://localhost" for port 80), so a literal ":{WebPort}"
+        // suffix comparison would wrongly reject legitimate same-origin requests on port 80.
+        if (!Uri.TryCreate(origin, UriKind.Absolute, out originUri)) return false;
+        int expectedPort;
+        if (!int.TryParse(WebPort, NumberStyles.None, CultureInfo.InvariantCulture, out expectedPort)) return false;
+        bool hostMatches = originUri.Host.Equals("localhost", StringComparison.OrdinalIgnoreCase) || originUri.Host == "127.0.0.1";
+        return originUri.Scheme == "http" && hostMatches && originUri.Port == expectedPort;
+    }
+
+    /// <summary>
     /// Processes HTTP requests and returns API data (JSON) or HTML content.
     /// </summary>
     static void ProcessRequest(HttpListenerContext context) {
         var res = context.Response;
         try {
             string path = context.Request.Url.AbsolutePath;
+            bool isMutatingApi = context.Request.HttpMethod == "POST" && (path == "/api/clear_offline" || path == "/api/clear_all");
+            if (isMutatingApi && !IsSameOriginRequest(context.Request)) {
+                res.StatusCode = 403;
+                return;
+            }
 
             if (path == "/api/clear_offline" && context.Request.HttpMethod == "POST") {
                 int count = 0;
@@ -777,9 +829,15 @@ async function fetchUI() {
                     const indent = depth * 25;
                     const arrow = depth > 0 ? `<span style=""color:#5de8b8;margin-right:6px;"">\u21B3</span>` : '';
                     
+                    // A Follower's own GM is only known when it has itself relayed an Announce/Sync
+                    // (e.g. acting as a Boundary Clock on another port). For an ordinary Follower that
+                    // only sends Delay_Req, p.gmId is never observed, so the value shown is inherited
+                    // from the parent and NOT independently confirmed -- label it as such rather than
+                    // implying mismatch detection is active.
+                    const gmInferred = (role === 'follower' && !p.gmId && !!parentGmId);
                     let gmIdText = p.gmId || (role === 'follower' ? parentGmId : 'N/A');
                     let gmStyle = isMismatch ? 'color:#ff4a4a;font-weight:bold;background:rgba(255,50,50,0.1);padding:2px 4px;border-radius:4px;' : 'opacity:0.9;';
-                    let gmLine = `<div class=""info-row"" style=""${gmStyle}margin-top:6px;font-family:monospace;"">GM: ${esc(gmIdText)}${isMismatch?' <span style=""margin-left:4px;"">\u26A0 GM Mismatch!</span>':''}</div>`;
+                    let gmLine = `<div class=""info-row"" style=""${gmStyle}margin-top:6px;font-family:monospace;"">GM: ${esc(gmIdText)}${gmInferred?' <span style=""opacity:0.6"">(inherited, unverified)</span>':''}${isMismatch?' <span style=""margin-left:4px;"">\u26A0 GM Mismatch!</span>':''}</div>`;
                     let logLine = (role === 'leader' && v === 'v2') ? `<div class=""info-row"" style=""opacity:0.7"">Sync: ${valS(p.syncLog)} / Announce: ${valS(p.announceLog)}</div>` : '';
                     let bmcLine = (role === 'leader' && v === 'v2' && p.gmPriority1 !== null) ? `<div class=""info-row"" style=""opacity:0.7"">BMC: P1=${valS(p.gmPriority1)} / Class=${valS(p.gmClass)} / P2=${valS(p.gmPriority2)}</div>` : '';
                     
@@ -829,7 +887,9 @@ async function pollLoop() {
 
 function csvEsc(v) {
     let s = String(v === null || v === undefined ? '' : v).replace(/""/g, '""""');
-    if (/^[=+\-@]/.test(s)) s = ""'"" + s; // Neutralize spreadsheet formula injection
+    // Neutralize spreadsheet formula injection: check after stripping leading whitespace/control
+    // characters, since some spreadsheet apps still evaluate a formula preceded by e.g. a tab.
+    if (/^[\s\x00-\x1F]*[=+\-@]/.test(s)) s = ""'"" + s;
     return '""' + s + '""';
 }
 

@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
@@ -11,46 +12,62 @@ using System.Linq;
 using System.Globalization;
 
 /// <summary>
-/// Holds the state for each PTP domain and version.
+/// Holds the state for one (PTP version, domain) instance observed from a device.
+/// A single device may own several instances at once (e.g. a Boundary Clock that is
+/// Leader on one domain and Follower on another, using the same PTP version).
 /// </summary>
 class ProtocolState {
-    public string Role { get; set; }
+    public string Version { get; set; }
     public string Domain { get; set; }
+    public string Role { get; set; }
     public string OwnId { get; set; }
     public string GrandmasterId { get; set; }
     public int? SyncLog { get; set; }
     public int? AnnounceLog { get; set; }
 
-    public DateTime? LastDelayReqSeen { get; set; }
+    public long? LastDelayReqSeenTicks { get; set; }
     public double? LastMeasuredIntervalMs { get; set; }
 
     public int? GmPriority1 { get; set; }
     public int? GmPriority2 { get; set; }
     public int? GmClass { get; set; }
 
-    public bool IsConflict { get; set; }
-    public DateTime? RoleChangedAt { get; set; }
-    public DateTime? ConflictStartedAt { get; set; }
+    // Freshness/online status for THIS instance specifically, so a stale Leader on one
+    // domain/version can't linger just because another instance of the same device is alive.
+    public long LastSeenTicks { get; set; }
+    public bool IsOnline { get; set; }
 
-    public ProtocolState() {
+    public bool IsConflict { get; set; }
+    public long? RoleChangedAtTicks { get; set; }
+    public long? ConflictStartedAtTicks { get; set; }
+    // Edge-trigger guard so [GM_MISMATCH] is logged once per mismatch episode, not on every packet.
+    public bool GmMismatchLogged { get; set; }
+
+    public ProtocolState(string version, string domain) {
+        Version = version;
+        Domain = domain;
         Role = "Unknown";
-        Domain = "0";
         OwnId = null;
         GrandmasterId = null;
         IsConflict = false;
+        IsOnline = true;
+        GmMismatchLogged = false;
     }
 }
 
 /// <summary>
 /// Holds information for each device on the network.
-/// Manages multiple protocol states in a dictionary.
+/// Manages multiple (version, domain) protocol instances in a dictionary.
 /// </summary>
 class DeviceInfo {
     public string IP { get; set; }
     public string Mac { get; set; }
     public Dictionary<string, ProtocolState> Protocols { get; set; }
-    public DateTime LastSeen { get; set; }
-    public DateTime FirstSeen { get; set; }
+    public long LastSeenTicks { get; set; }
+    public long FirstSeenTicks { get; set; }
+    // Reset whenever the device transitions offline -> online, so "Uptime" reflects the
+    // current session rather than accumulating across outages.
+    public long OnlineSinceTicks { get; set; }
     public bool IsOnline { get; set; }
     public bool HasJoined { get; set; }
 
@@ -58,11 +75,26 @@ class DeviceInfo {
         IP = ip;
         Mac = "Unknown";
         Protocols = new Dictionary<string, ProtocolState>();
-        LastSeen = DateTime.Now;
-        FirstSeen = DateTime.Now;
+        long now = Program.NowTicks();
+        LastSeenTicks = now;
+        FirstSeenTicks = now;
+        OnlineSinceTicks = now;
         IsOnline = true;
         HasJoined = false;
     }
+}
+
+/// <summary>
+/// A Follower-to-Leader topology edge confirmed via a matched Delay_Resp. Only confirmed
+/// edges are persisted; an unconfirmed "best guess" is computed on demand at read time so a
+/// stale guess can never outlive the situation that produced it (see FindFallbackLeaderIp).
+/// </summary>
+class TopologyLink {
+    public string Version { get; set; }
+    public string Domain { get; set; }
+    public string FollowerIp { get; set; }
+    public string LeaderIp { get; set; }
+    public long ConfirmedAtTicks { get; set; }
 }
 
 /// <summary>
@@ -77,22 +109,45 @@ class Program {
     static double ExpectedDelayInterval = 2.0;    // Added in v1.6.8
     static double DelayAlertThresholdRate = 1.5;  // Added in v1.6.8
     static double OfflineTimeoutSeconds = 10.0;   // Added in v1.6.8
+    // How long two simultaneous Leaders must persist in the same (version, domain) before a
+    // [CONFLICT_ALERT] is logged. Not a mutable readonly const so tests can shrink it for speed.
+    static double ConflictPersistThresholdSeconds = 10.0;
     static readonly int MaxDevices = 512;         // Cap to prevent unbounded memory growth from spoofed sources
+    static readonly int MaxRotatedLogFiles = 20;  // Cap rotated log generations to bound disk usage
     static bool deviceLimitWarned = false;
 
+    // Composite dictionary keys are built as "version" + KeySep + "domain" [+ KeySep + "followerIp"].
+    // A control character is used as the separator (rather than e.g. '|') because a v1 "domain" is
+    // parsed directly from packet bytes and could otherwise collide with a printable separator.
+    const string KeySep = "";
+
     static Dictionary<string, DeviceInfo> devices = new Dictionary<string, DeviceInfo>();
-    static Dictionary<string, string> followerToLeaderV1 = new Dictionary<string, string>();
-    static Dictionary<string, string> followerToLeaderV2 = new Dictionary<string, string>();
+    static Dictionary<string, TopologyLink> topologyLinks = new Dictionary<string, TopologyLink>();
     static CancellationTokenSource cts = new CancellationTokenSource();
     static StreamWriter logWriter = null;
     static string currentLogPath = "ptp_monitor.log";
     static object printLock = new object();
     static List<string> logs = new List<string>();
     static object logLock = new object();
-    
+    static SemaphoreSlim httpConcurrency = new SemaphoreSlim(64, 64);
+
     static Dictionary<string, string> customVendors = new Dictionary<string, string>();
     static IPAddress currentLocalIp = IPAddress.Any;
     static HttpListener httpListener = new HttpListener();
+
+    /// <summary>
+    /// Monotonic timestamp (not affected by NTP corrections or manual clock changes) for
+    /// duration/elapsed-time math. Absolute wall-clock display (log timestamps) still uses
+    /// DateTime.Now separately.
+    /// </summary>
+    public static long NowTicks() { return Stopwatch.GetTimestamp(); }
+
+    public static double ElapsedSeconds(long fromTicks) {
+        return (double)(Stopwatch.GetTimestamp() - fromTicks) / Stopwatch.Frequency;
+    }
+
+    static string StateKey(string version, string domain) { return version + KeySep + domain; }
+    static string LinkKey(string version, string domain, string followerIp) { return version + KeySep + domain + KeySep + followerIp; }
 
     /// <summary>
     /// Entry point. Handles interface selection and starts monitoring tasks.
@@ -100,10 +155,10 @@ class Program {
     static void Main(string[] args) {
         LoadConfig();
         Console.WriteLine("=== PTPMonitor v1.7.0 ===");
-        
+
         NetworkInterface[] nics = NetworkInterface.GetAllNetworkInterfaces();
         List<IPAddress> validIps = new List<IPAddress>();
-        
+
         Console.WriteLine("\n[Available IPv4 Interfaces]");
         int index = 1;
         foreach (var nic in nics) {
@@ -117,7 +172,7 @@ class Program {
                 }
             }
         }
-        
+
         if (validIps.Count == 0) { Console.WriteLine("Error: No valid IPv4 interfaces found."); return; }
         Console.Write(string.Format("\nSelect NIC Number (1-{0}) [Default: 1]: ", validIps.Count));
         string input = Console.ReadLine();
@@ -207,6 +262,7 @@ class Program {
                     sock.Close();
                 } catch (Exception) { /* Best-effort cleanup during shutdown */ }
             }
+            try { if (httpListener.IsListening) httpListener.Stop(); httpListener.Close(); } catch (Exception) { /* Best-effort cleanup during shutdown */ }
             lock(printLock) {
                 if(logWriter != null) { logWriter.Close(); logWriter = null; }
             }
@@ -223,12 +279,12 @@ class Program {
         try {
             string path = "config.ini";
             if (!File.Exists(path)) {
-                string[] defaults = { 
-                    "[Settings]", 
-                    "OfflineRetentionHours = 24", 
-                    "", 
-                    "# OUI Vendor Mapping (OUI=VendorName)", 
-                    "00:1D:C1=Audinate (Dante)", "00:01:E1=Yamaha", "00:A0:DE=Yamaha", "EC:22:80=Yamaha", "00:07:CF=Yamaha", "00:0E:DD=Shure", "00:14:96=Shure" 
+                string[] defaults = {
+                    "[Settings]",
+                    "OfflineRetentionHours = 24",
+                    "",
+                    "# OUI Vendor Mapping (OUI=VendorName)",
+                    "00:1D:C1=Audinate (Dante)", "00:01:E1=Yamaha", "00:A0:DE=Yamaha", "EC:22:80=Yamaha", "00:07:CF=Yamaha", "00:0E:DD=Shure", "00:14:96=Shure"
                 };
                 File.WriteAllLines(path, defaults);
             }
@@ -290,11 +346,26 @@ class Program {
             if (!moved && File.Exists(old)) { try { File.WriteAllText(old, ""); } catch (Exception) { /* Log file locked; appending continues */ } }
             logWriter = new StreamWriter(new FileStream(currentLogPath, FileMode.Append, FileAccess.Write, FileShare.ReadWrite)) { AutoFlush = true };
             logWriter.WriteLine(string.Format("[{0:yyyy-MM-dd HH:mm:ss}] --- Log Session Started ---", DateTime.Now));
+            PruneOldLogFiles(logDir);
         } catch (Exception ex) {
             // File logging is optional: never let rotation failures (permissions, disk full) kill monitoring.
             logWriter = null;
             Console.WriteLine("[WARN] Cannot prepare log file '" + currentLogPath + "': " + ex.Message + " (console/Web UI logging only)");
         }
+    }
+
+    /// <summary>
+    /// Keeps at most MaxRotatedLogFiles rotated logs (oldest deleted first, ordered by the
+    /// sortable timestamp embedded in the filename) so log rotation cannot fill the disk.
+    /// </summary>
+    static void PruneOldLogFiles(string logDir) {
+        try {
+            var files = Directory.GetFiles(logDir, "ptp_monitor_*.log");
+            Array.Sort(files, StringComparer.Ordinal);
+            for (int i = 0; i < files.Length - MaxRotatedLogFiles; i++) {
+                try { File.Delete(files[i]); } catch (Exception) { /* Best-effort; a locked file is skipped */ }
+            }
+        } catch (Exception) { /* Best-effort cleanup; never fail startup over this */ }
     }
 
     /// <summary>
@@ -331,14 +402,28 @@ class Program {
     }
 
     /// <summary>
-    /// Removes a device's topology links, including links of other nodes that point to it as parent.
+    /// Removes a device's confirmed topology links, in either direction (as follower or as leader).
     /// Must be called while holding lock(devices).
     /// </summary>
     static void RemoveDeviceLinks(string ip) {
-        followerToLeaderV1.Remove(ip);
-        followerToLeaderV2.Remove(ip);
-        foreach (var k in followerToLeaderV1.Where(x => x.Value == ip).Select(x => x.Key).ToList()) followerToLeaderV1.Remove(k);
-        foreach (var k in followerToLeaderV2.Where(x => x.Value == ip).Select(x => x.Key).ToList()) followerToLeaderV2.Remove(k);
+        var toRemove = topologyLinks.Where(kv => kv.Value.LeaderIp == ip || kv.Value.FollowerIp == ip).Select(kv => kv.Key).ToList();
+        foreach (var k in toRemove) topologyLinks.Remove(k);
+    }
+
+    /// <summary>
+    /// Finds an online Leader for (version, domain) to use as a display-only "best guess" parent
+    /// when no Delay_Resp-confirmed link exists yet. Never cached: recomputed on every read so a
+    /// bad guess (e.g. picked while two Leaders briefly coexisted) can't outlive the situation that
+    /// produced it. Must be called while holding lock(devices).
+    /// </summary>
+    static string FindFallbackLeaderIp(string version, string domain, string excludeIp) {
+        string key = StateKey(version, domain);
+        foreach (var d in devices.Values) {
+            if (d.IP == excludeIp) continue;
+            ProtocolState ps;
+            if (d.Protocols.TryGetValue(key, out ps) && ps.Role == "Leader" && ps.IsOnline) return d.IP;
+        }
+        return null;
     }
 
     /// <summary>
@@ -360,20 +445,41 @@ class Program {
             msgType = (byte)(data[0] & 0x0F);
             domain = data[4].ToString();
             if (len >= 28) ownId = BitConverter.ToString(data, 20, 8).Replace("-","");
+            // IEEE 1588-2008 Table 41: event messages (Sync=0, Delay_Req=1, Pdelay_Req=2,
+            // Pdelay_Resp=3) go on UDP port 319; general messages (Follow_Up=8, Delay_Resp=9,
+            // Pdelay_Resp_Follow_Up=10, Announce=11, Signaling=12, Management=13) go on port 320.
+            // This is a fixed, undisputed part of the spec (unlike PTPv1 byte offsets) -- traffic
+            // that violates it is spoofed or malformed and is dropped rather than trusted.
+            bool isEventMessage = msgType <= 3;
+            if (isEventMessage && port != 319) return;
+            if (!isEventMessage && port != 320) return;
             if (msgType == 0 || msgType == 11 || msgType == 8 || msgType == 9) role = "Leader"; // Sync, Announce, Follow_Up, Delay_Resp
             else if (msgType == 1) role = "Follower"; // Delay_Req (Pdelay_Req excluded: P2P leaders send it too)
         } else {
             if (len < 40) return;
-            // PTPv1 (IEEE 1588-2002): messageType (offset 20) only distinguishes Event(1)/General(2).
-            // The actual message kind is in the control field (offset 32):
+            // PTPv1 (IEEE 1588-2002): messageType (offset 20) only distinguishes Event(1, port 319)
+            // from General(2, port 320). The actual message kind is in the control field (offset 32):
             // 0=Sync, 1=Delay_Req, 2=Follow_Up, 3=Delay_Resp, 4=Management.
             msgType = data[20];
+            if (msgType == 1 && port != 319) return;
+            if (msgType == 2 && port != 320) return;
+            if (msgType != 1 && msgType != 2) return; // Neither Event nor General: not a valid v1 header
             control = data[32];
+            // messageType (Event/General) and control (the actual message kind) must agree: Sync(0) and
+            // Delay_Req(1) are Event messages, Follow_Up(2)/Delay_Resp(3)/Management(4) are General. A
+            // packet claiming e.g. General(2)/port 320 while control says Delay_Req(1) is inconsistent
+            // with the spec and is dropped rather than trusted (closes a port-check bypass).
+            bool controlIsEvent = control == 0 || control == 1;
+            if (msgType == 1 && !controlIsEvent) return;
+            if (msgType == 2 && controlIsEvent) return;
             domain = Encoding.UTF8.GetString(data, 4, 16).TrimEnd('\0', ' ');
             ownId = BitConverter.ToString(data, 22, 6).Replace("-","");
             if (control == 0 || control == 2 || control == 3) role = "Leader"; // Sync, Follow_Up, Delay_Resp
             else if (control == 1) role = "Follower"; // Delay_Req
         }
+
+        long now = NowTicks();
+        string stateKey = StateKey(protoVer, domain);
 
         lock(devices) {
             if (!devices.ContainsKey(ip)) {
@@ -387,17 +493,24 @@ class Program {
                 devices[ip] = new DeviceInfo(ip);
             }
             var dev = devices[ip];
-            dev.LastSeen = DateTime.Now; dev.IsOnline = true;
+            dev.LastSeenTicks = now;
+            if (!dev.IsOnline) {
+                dev.IsOnline = true;
+                dev.OnlineSinceTicks = now;
+                Log(string.Format("[REJOIN] {0} ({1}) responded again after being offline.", GetVendorSafe(dev.Mac), ip));
+            }
             if (dev.Mac == "Unknown" && ownId.Length >= 12) {
                 // Try to derive MAC from OwnId (UI purpose)
                 if (protoVer == "v2" && ownId.Length == 16) dev.Mac = ownId.Substring(0,2)+":"+ownId.Substring(2,2)+":"+ownId.Substring(4,2)+":"+ownId.Substring(10,2)+":"+ownId.Substring(12,2)+":"+ownId.Substring(14,2);
                 else if (protoVer == "v1" && ownId.Length == 12) dev.Mac = ownId.Substring(0,2)+":"+ownId.Substring(2,2)+":"+ownId.Substring(4,2)+":"+ownId.Substring(6,2)+":"+ownId.Substring(8,2)+":"+ownId.Substring(10,2);
             }
 
-            if (!dev.Protocols.ContainsKey(protoVer)) dev.Protocols[protoVer] = new ProtocolState();
-            var pState = dev.Protocols[protoVer];
+            if (!dev.Protocols.ContainsKey(stateKey)) dev.Protocols[stateKey] = new ProtocolState(protoVer, domain);
+            var pState = dev.Protocols[stateKey];
             string oldRole = pState.Role;
-            pState.Domain = domain; pState.OwnId = ownId;
+            pState.OwnId = ownId;
+            pState.LastSeenTicks = now;
+            pState.IsOnline = true;
             if (role != "Unknown") pState.Role = role;
 
             if (protoVer == "v2") {
@@ -418,16 +531,29 @@ class Program {
                 }
             }
 
-            // Accurate Topology Linking via Delay_Resp
+            // Accurate Topology Linking via Delay_Resp: record a confirmed edge for the follower
+            // instance whose OwnId matches AND whose domain matches this Delay_Resp's own domain
+            // (a device present in multiple domains under the same OwnId must not have a Delay_Resp
+            // for one domain confirm a link in a different domain it happens to also be in).
             if (protoVer == "v2" && msgType == 9 && len >= 52) { // v2 Delay_Resp
                 string reqId = BitConverter.ToString(data, 44, 8).Replace("-","");
-                foreach(var d in devices.Values) {
-                    if (d.Protocols.ContainsKey("v2") && d.Protocols["v2"].OwnId == reqId) followerToLeaderV2[d.IP] = ip;
+                foreach (var d in devices.Values) {
+                    foreach (var kv in d.Protocols) {
+                        if (kv.Value.Version == "v2" && kv.Value.Domain == domain && kv.Value.OwnId == reqId) {
+                            string linkKey = LinkKey("v2", domain, d.IP);
+                            topologyLinks[linkKey] = new TopologyLink { Version = "v2", Domain = domain, FollowerIp = d.IP, LeaderIp = ip, ConfirmedAtTicks = now };
+                        }
+                    }
                 }
             } else if (protoVer == "v1" && control == 3 && len >= 56) { // v1 Delay_Resp
                 string reqId = BitConverter.ToString(data, 50, 6).Replace("-",""); // requestingSourceUuid (offset 50)
-                foreach(var d in devices.Values) {
-                    if (d.Protocols.ContainsKey("v1") && d.Protocols["v1"].OwnId == reqId) followerToLeaderV1[d.IP] = ip;
+                foreach (var d in devices.Values) {
+                    foreach (var kv in d.Protocols) {
+                        if (kv.Value.Version == "v1" && kv.Value.Domain == domain && kv.Value.OwnId == reqId) {
+                            string linkKey = LinkKey("v1", domain, d.IP);
+                            topologyLinks[linkKey] = new TopologyLink { Version = "v1", Domain = domain, FollowerIp = d.IP, LeaderIp = ip, ConfirmedAtTicks = now };
+                        }
+                    }
                 }
             }
 
@@ -438,11 +564,11 @@ class Program {
                 if (pState.GrandmasterId != null && pState.GrandmasterId != gmId) Log(string.Format("[GM_CHANGE] {0} v2 GM -> {1}", ip, gmId));
                 pState.GrandmasterId = gmId;
             }
-            
+
             // Clear self-assigned/stale flags if the node is now a Follower
             if (role == "Follower") {
                 if (pState.GrandmasterId == ownId) pState.GrandmasterId = null;
-                pState.IsConflict = false; pState.ConflictStartedAt = null; 
+                pState.IsConflict = false; pState.ConflictStartedAtTicks = null;
             }
 
             // Auto-initialize GM ID for Leaders
@@ -450,73 +576,117 @@ class Program {
                 pState.GrandmasterId = ownId;
             }
 
-            if (role == "Leader") {
-                bool foundOther = false;
-                foreach (var other in devices.Values) {
-                    if (other.IP == ip) continue;
-                    if (other.IsOnline && other.Protocols.ContainsKey(protoVer)) {
-                        var op = other.Protocols[protoVer];
-                        if (op.Role == "Leader" && op.Domain == domain) foundOther = true;
-                    }
-                }
-                
-                if (foundOther) {
-                    if (!pState.ConflictStartedAt.HasValue) pState.ConflictStartedAt = DateTime.Now;
-                    double sec = (DateTime.Now - pState.ConflictStartedAt.Value).TotalSeconds;
-                    if (sec >= 10.0) {
-                        if (!pState.IsConflict) Log(string.Format("[CONFLICT_ALERT] Domain {0} ({1}) Persistent conflict detected (10s+).", domain, protoVer));
-                        pState.IsConflict = true; 
-                    }
-                } else {
-                    pState.ConflictStartedAt = null; pState.IsConflict = false;
-                }
-            }
-
-            if (pState.Role == "Follower") {
-                var dict = (protoVer == "v1") ? followerToLeaderV1 : followerToLeaderV2;
-                if (!dict.ContainsKey(ip)) {
-                    var leader = devices.Values.FirstOrDefault(d => d.IsOnline && d.Protocols.ContainsKey(protoVer) && d.Protocols[protoVer].Role == "Leader" && d.Protocols[protoVer].Domain == domain);
-                    if (leader != null) dict[ip] = leader.IP;
-                }
-                
-                // GM Mismatch Detection (Troubleshooting)
-                if (dict.ContainsKey(ip) && devices.ContainsKey(dict[ip])) {
-                    var parentNode = devices[dict[ip]];
-                    if (parentNode.Protocols.ContainsKey(protoVer)) {
-                        var pP = parentNode.Protocols[protoVer];
-                        if (pP.GrandmasterId != null && pState.GrandmasterId != null && pState.GrandmasterId != pP.GrandmasterId) {
-                            Log(string.Format("[GM_MISMATCH] {0} ({1}) is following GM {2}, but its parent {3} follows GM {4}!", ip, protoVer, pState.GrandmasterId, dict[ip], pP.GrandmasterId));
-                        }
-                    }
-                }
-            }
-
+            // Conflict detection (multiple Leaders in the same domain) and GM-mismatch detection
+            // are handled centrally in MonitorLoop's periodic sweep, not per-packet here: that
+            // keeps this per-packet path O(1) instead of an O(N) device scan on every Leader
+            // packet, and makes conflict duration advance on wall-clock time instead of only
+            // when packets happen to arrive.
 
             if (role == "Follower" && ((protoVer == "v2" && msgType == 1) || (protoVer == "v1" && control == 1))) { // Delay_Req
-                if (pState.LastDelayReqSeen.HasValue) {
-                    pState.LastMeasuredIntervalMs = (DateTime.Now - pState.LastDelayReqSeen.Value).TotalMilliseconds;
+                if (pState.LastDelayReqSeenTicks.HasValue) {
+                    pState.LastMeasuredIntervalMs = ElapsedSeconds(pState.LastDelayReqSeenTicks.Value) * 1000.0;
                 }
-                pState.LastDelayReqSeen = DateTime.Now;
+                pState.LastDelayReqSeenTicks = now;
             }
 
             if (!dev.HasJoined) { dev.HasJoined = true; Log(string.Format("[JOIN] {0} ({1}) joined as {2}", ip, dev.Mac, role)); }
-            if (oldRole != role && role != "Unknown") { pState.RoleChangedAt = DateTime.Now; Log(string.Format("[ROLE_CHANGE] {0} ({1}) {2} -> {3}", ip, protoVer, oldRole, role)); }
+            if (oldRole != role && role != "Unknown") { pState.RoleChangedAtTicks = now; Log(string.Format("[ROLE_CHANGE] {0} ({1}) {2} -> {3}", ip, protoVer, oldRole, role)); }
         }
     }
 
     /// <summary>
-    /// Background loop for device online status monitoring and data retention management.
+    /// Background loop: device/instance online status, data retention, conflict detection
+    /// (multiple Leaders per domain), GM-mismatch detection, and confirmed-link expiry. Centralizing
+    /// these here (instead of per-packet) bounds their cost to one O(N) pass per second regardless
+    /// of traffic volume, and makes duration-based conditions (10s+ conflict) advance on wall-clock
+    /// time rather than only when a matching packet happens to arrive.
     /// </summary>
     static void MonitorLoop() {
         while(!cts.Token.IsCancellationRequested) {
             lock(devices) {
+                long now = NowTicks();
                 var toRemove = new List<string>();
-                foreach(var kvp in devices) {
-                    var dev = kvp.Value;
-                    double idle = (DateTime.Now - dev.LastSeen).TotalSeconds;
+
+                foreach (var dev in devices.Values) {
+                    foreach (var pState in dev.Protocols.Values) {
+                        if (pState.IsOnline && ElapsedSeconds(pState.LastSeenTicks) >= OfflineTimeoutSeconds) {
+                            pState.IsOnline = false;
+                            pState.IsConflict = false; pState.ConflictStartedAtTicks = null; pState.GmMismatchLogged = false;
+                        }
+                    }
+                    double idle = ElapsedSeconds(dev.LastSeenTicks);
                     if (idle >= OfflineTimeoutSeconds && dev.IsOnline) { dev.IsOnline = false; Log(string.Format("[OFFLINE] {0} ({1}) stopped responding.", GetVendorSafe(dev.Mac), dev.IP)); }
-                    if (OfflineRetentionHours > 0 && idle >= (OfflineRetentionHours * 3600.0)) toRemove.Add(kvp.Key);
+                    if (OfflineRetentionHours > 0 && idle >= (OfflineRetentionHours * 3600.0)) toRemove.Add(dev.IP);
                 }
+
+                // Group all currently-online Leader instances by (Version, Domain); 2+ in the same
+                // group means those Leaders are in conflict with each other.
+                var leaderGroups = new Dictionary<string, List<ProtocolState>>();
+                foreach (var dev in devices.Values) {
+                    foreach (var pState in dev.Protocols.Values) {
+                        if (pState.IsOnline && pState.Role == "Leader") {
+                            string key = StateKey(pState.Version, pState.Domain);
+                            List<ProtocolState> list;
+                            if (!leaderGroups.TryGetValue(key, out list)) { list = new List<ProtocolState>(); leaderGroups[key] = list; }
+                            list.Add(pState);
+                        }
+                    }
+                }
+                foreach (var group in leaderGroups.Values) {
+                    bool conflicted = group.Count >= 2;
+                    foreach (var pState in group) {
+                        if (conflicted) {
+                            if (!pState.ConflictStartedAtTicks.HasValue) pState.ConflictStartedAtTicks = now;
+                            double sec = ElapsedSeconds(pState.ConflictStartedAtTicks.Value);
+                            if (sec >= ConflictPersistThresholdSeconds) {
+                                if (!pState.IsConflict) Log(string.Format("[CONFLICT_ALERT] Domain {0} ({1}) Persistent conflict detected (10s+).", pState.Domain, pState.Version));
+                                pState.IsConflict = true;
+                            }
+                        } else {
+                            pState.ConflictStartedAtTicks = null; pState.IsConflict = false;
+                        }
+                    }
+                }
+
+                // Expire confirmed topology links whose Leader is no longer valid (offline, or no
+                // longer Leader in that domain), then check GM-mismatch on the links that remain.
+                var staleLinks = new List<string>();
+                foreach (var kv in topologyLinks) {
+                    var link = kv.Value;
+                    string key = StateKey(link.Version, link.Domain);
+                    DeviceInfo leaderDev;
+                    ProtocolState leaderState;
+                    if (!devices.TryGetValue(link.LeaderIp, out leaderDev) || !leaderDev.Protocols.TryGetValue(key, out leaderState) || leaderState.Role != "Leader" || !leaderState.IsOnline) {
+                        staleLinks.Add(kv.Key);
+                        // Reset the guard so a genuinely new mismatch (after this follower is later
+                        // confirmed against a different Leader) is logged fresh instead of being
+                        // silently suppressed by a guard left over from this now-defunct link.
+                        DeviceInfo staleFollowerDev;
+                        ProtocolState staleFollowerState;
+                        if (devices.TryGetValue(link.FollowerIp, out staleFollowerDev) && staleFollowerDev.Protocols.TryGetValue(key, out staleFollowerState)) staleFollowerState.GmMismatchLogged = false;
+                        continue;
+                    }
+
+                    DeviceInfo followerDev;
+                    ProtocolState followerState;
+                    if (!devices.TryGetValue(link.FollowerIp, out followerDev) || !followerDev.Protocols.TryGetValue(key, out followerState) || !followerState.IsOnline) continue;
+                    // A confirmed link only describes a Follower relationship; if this instance has
+                    // since become a Leader itself (e.g. after a BMCA re-election) it is no longer
+                    // "following" anyone, so evaluating a mismatch against the old parent is meaningless.
+                    if (followerState.Role != "Follower") { followerState.GmMismatchLogged = false; continue; }
+
+                    bool mismatch = followerState.GrandmasterId != null && leaderState.GrandmasterId != null && followerState.GrandmasterId != leaderState.GrandmasterId;
+                    if (mismatch) {
+                        if (!followerState.GmMismatchLogged) {
+                            Log(string.Format("[GM_MISMATCH] {0} ({1}) is following GM {2}, but its parent {3} follows GM {4}!", link.FollowerIp, link.Version, followerState.GrandmasterId, link.LeaderIp, leaderState.GrandmasterId));
+                            followerState.GmMismatchLogged = true;
+                        }
+                    } else {
+                        followerState.GmMismatchLogged = false;
+                    }
+                }
+                foreach (var k in staleLinks) topologyLinks.Remove(k);
+
                 foreach(var k in toRemove) {
                     Log("[LEAVE] " + devices[k].IP + " (Retention expired)");
                     RemoveDeviceLinks(k);
@@ -558,8 +728,19 @@ class Program {
                 }
                 continue;
             }
-            // Dispatch to the thread pool so one slow client cannot block other requests
-            Task.Factory.StartNew(() => ProcessRequest(context));
+            // Reject immediately on the accept thread, before spawning a Task, so a flood of slow
+            // clients cannot queue an unbounded number of pending work items on the thread pool --
+            // this is the actual admission-control point; the Wait(0) below is just the corresponding
+            // release-side bookkeeping once a request has been admitted.
+            if (!httpConcurrency.Wait(0)) {
+                try { context.Response.StatusCode = 503; context.Response.Close(); } catch (Exception) { /* Best-effort */ }
+                continue;
+            }
+            var ctxCopy = context;
+            // Dispatch to the thread pool so one slow client cannot block other requests.
+            Task.Factory.StartNew(() => {
+                try { ProcessRequest(ctxCopy); } finally { httpConcurrency.Release(); }
+            });
         }
     }
 
@@ -643,7 +824,7 @@ class Program {
                 Log(string.Format("[SYSTEM] Offline devices cleared by WebUI ({0} nodes).", count));
                 res.StatusCode = 200;
             } else if (path == "/api/clear_all" && context.Request.HttpMethod == "POST") {
-                lock(devices) { devices.Clear(); followerToLeaderV1.Clear(); followerToLeaderV2.Clear(); }
+                lock(devices) { devices.Clear(); topologyLinks.Clear(); }
                 lock(logLock) { logs.Clear(); }
                 Log("[SYSTEM] Network state and logs cleared by WebUI.");
                 res.StatusCode = 200;
@@ -657,31 +838,40 @@ class Program {
                         if(!f) sb.Append(","); f = false;
                         sb.Append("{\"ip\":").Append(JsonStr(dev.IP)).Append(",\"mac\":").Append(JsonStr(dev.Mac));
                         sb.Append(",\"online\":").Append(dev.IsOnline?"true":"false").Append(",");
-                        sb.Append("\"idleSeconds\":").Append((int)(DateTime.Now-dev.LastSeen).TotalSeconds).Append(",");
-                        sb.Append("\"uptimeSeconds\":").Append((int)(DateTime.Now-dev.FirstSeen).TotalSeconds).Append(",");
-                        sb.Append("\"protocols\":{"); bool fp = true;
-                        foreach(var p in dev.Protocols) {
+                        sb.Append("\"idleSeconds\":").Append((int)ElapsedSeconds(dev.LastSeenTicks)).Append(",");
+                        sb.Append("\"uptimeSeconds\":").Append((int)ElapsedSeconds(dev.OnlineSinceTicks)).Append(",");
+                        sb.Append("\"protocols\":["); bool fp = true;
+                        foreach(var kv in dev.Protocols) {
+                            var pState = kv.Value;
                             if(!fp) sb.Append(","); fp = false;
-                            string pip = "";
-                            if (p.Key == "v1" && followerToLeaderV1.ContainsKey(dev.IP)) pip = followerToLeaderV1[dev.IP];
-                            if (p.Key == "v2" && followerToLeaderV2.ContainsKey(dev.IP)) pip = followerToLeaderV2[dev.IP];
-                            sb.Append(JsonStr(p.Key)).Append(":{\"role\":").Append(JsonStr(p.Value.Role));
-                            sb.Append(",\"domain\":").Append(JsonStr(p.Value.Domain));
-                            sb.Append(",\"ownId\":").Append(JsonStr(p.Value.OwnId ?? "")).Append(",");
-                            sb.Append("\"syncLog\":").Append(p.Value.SyncLog.HasValue ? p.Value.SyncLog.Value.ToString() : "null");
-                            sb.Append(",\"announceLog\":").Append(p.Value.AnnounceLog.HasValue ? p.Value.AnnounceLog.Value.ToString() : "null").Append(",");
-                            sb.Append("\"gmId\":").Append(JsonStr(p.Value.GrandmasterId ?? ""));
+                            string parentIp = ""; bool linkConfirmed = false;
+                            TopologyLink link;
+                            if (topologyLinks.TryGetValue(LinkKey(pState.Version, pState.Domain, dev.IP), out link)) {
+                                parentIp = link.LeaderIp; linkConfirmed = true;
+                            } else if (pState.Role == "Follower") {
+                                string fb = FindFallbackLeaderIp(pState.Version, pState.Domain, dev.IP);
+                                if (fb != null) parentIp = fb;
+                            }
+                            sb.Append("{\"version\":").Append(JsonStr(pState.Version));
+                            sb.Append(",\"domain\":").Append(JsonStr(pState.Domain));
+                            sb.Append(",\"role\":").Append(JsonStr(pState.Role));
+                            sb.Append(",\"online\":").Append(pState.IsOnline?"true":"false").Append(",");
+                            sb.Append("\"ownId\":").Append(JsonStr(pState.OwnId ?? "")).Append(",");
+                            sb.Append("\"syncLog\":").Append(pState.SyncLog.HasValue ? pState.SyncLog.Value.ToString() : "null");
+                            sb.Append(",\"announceLog\":").Append(pState.AnnounceLog.HasValue ? pState.AnnounceLog.Value.ToString() : "null").Append(",");
+                            sb.Append("\"gmId\":").Append(JsonStr(pState.GrandmasterId ?? ""));
                             sb.Append(",\"vendor\":").Append(JsonStr(GetVendorSafe(dev.Mac))).Append(",");
-                            sb.Append("\"gmPriority1\":").Append(p.Value.GmPriority1.HasValue ? p.Value.GmPriority1.Value.ToString() : "null").Append(",");
-                            sb.Append("\"gmClass\":").Append(p.Value.GmClass.HasValue ? p.Value.GmClass.Value.ToString() : "null").Append(",");
-                            sb.Append("\"gmPriority2\":").Append(p.Value.GmPriority2.HasValue ? p.Value.GmPriority2.Value.ToString() : "null").Append(",");
-                            sb.Append("\"isConflict\":").Append(p.Value.IsConflict?"true":"false").Append(",");
-                            sb.Append("\"conflictSeconds\":").Append(p.Value.ConflictStartedAt.HasValue?(int)(DateTime.Now-p.Value.ConflictStartedAt.Value).TotalSeconds:0).Append(",");
-                            sb.Append("\"lastMeasuredIntervalMs\":").Append(p.Value.LastMeasuredIntervalMs.HasValue?((int)p.Value.LastMeasuredIntervalMs.Value).ToString():"null").Append(",");
-                            sb.Append("\"parentIp\":").Append(JsonStr(pip)).Append(",");
-                            sb.Append("\"roleElapsedSeconds\":").Append(p.Value.RoleChangedAt.HasValue?(int)(DateTime.Now-p.Value.RoleChangedAt.Value).TotalSeconds:-1).Append("}");
+                            sb.Append("\"gmPriority1\":").Append(pState.GmPriority1.HasValue ? pState.GmPriority1.Value.ToString() : "null").Append(",");
+                            sb.Append("\"gmClass\":").Append(pState.GmClass.HasValue ? pState.GmClass.Value.ToString() : "null").Append(",");
+                            sb.Append("\"gmPriority2\":").Append(pState.GmPriority2.HasValue ? pState.GmPriority2.Value.ToString() : "null").Append(",");
+                            sb.Append("\"isConflict\":").Append(pState.IsConflict?"true":"false").Append(",");
+                            sb.Append("\"conflictSeconds\":").Append(pState.ConflictStartedAtTicks.HasValue?((int)ElapsedSeconds(pState.ConflictStartedAtTicks.Value)).ToString():"0").Append(",");
+                            sb.Append("\"lastMeasuredIntervalMs\":").Append(pState.LastMeasuredIntervalMs.HasValue?((int)pState.LastMeasuredIntervalMs.Value).ToString():"null").Append(",");
+                            sb.Append("\"parentIp\":").Append(JsonStr(parentIp)).Append(",");
+                            sb.Append("\"linkConfirmed\":").Append(linkConfirmed?"true":"false").Append(",");
+                            sb.Append("\"roleElapsedSeconds\":").Append(pState.RoleChangedAtTicks.HasValue?((int)ElapsedSeconds(pState.RoleChangedAtTicks.Value)).ToString():"-1").Append("}");
                         }
-                        sb.Append("}}");
+                        sb.Append("]}");
                     }
                     sb.Append("],\"logs\":[");
                     lock(logLock) {
@@ -722,6 +912,7 @@ header{display:flex;justify-content:space-between;align-items:center;margin-bott
 .glass{background:var(--glass);backdrop-filter:blur(20px);border:1px solid var(--border);border-radius:16px;padding:1.5rem;}
 .node{background:rgba(255,255,255,0.02);border:1px solid var(--border);border-radius:12px;padding:1rem;margin-bottom:0.8rem;border-left:4px solid var(--offline);}
 .node.leader{border-left-color:var(--leader);} .node.follower{border-left-color:var(--follower);} .node.offline{opacity:0.5;}
+.node.unconfirmed-link{border-left-style:dashed;}
 .mac{font-family:monospace;font-weight:bold;font-size:1.1rem;}
 .role-badge{font-size:0.7rem;font-weight:600;padding:2px 6px;border-radius:6px;text-transform:none;margin-left:5px;}
 .role-badge.leader{background:rgba(255,112,144,0.15);color:var(--leader);}
@@ -741,6 +932,15 @@ button:hover{border-color:var(--accent);}
 .live-indicator{display:inline-flex;align-items:center;gap:6px;font-size:0.75rem;color:#aaa;background:rgba(255,255,255,0.05);padding:4px 10px;border-radius:20px;border:1px solid var(--border);}
 .dot{width:8px;height:8px;background:var(--follower);border-radius:50%;box-shadow:0 0 8px var(--follower);animation:pulse 2s infinite;}
 @keyframes pulse{0%{opacity:1;transform:scale(1);}50%{opacity:0.3;transform:scale(1.2);}100%{opacity:1;transform:scale(1);}}
+.toolbar{display:flex;gap:10px;align-items:center;margin-bottom:1rem;flex-wrap:wrap;}
+.search-input{background:var(--glass);border:1px solid var(--border);color:#fff;padding:6px 10px;border-radius:6px;font-size:0.8rem;min-width:240px;}
+.search-input::placeholder{color:#777;}
+.alert-banner{background:rgba(255,50,50,0.08);border:1px solid #ff4a4a;border-radius:12px;padding:0.8rem 1rem;margin-bottom:1.5rem;font-size:0.8rem;}
+.alert-item{cursor:pointer;color:#ff9090;padding:2px 0;}
+.alert-item:hover{text-decoration:underline;}
+.log-filters{display:flex;gap:6px;margin-bottom:0.5rem;}
+.log-filters button.active{border-color:var(--accent);color:var(--accent);}
+.unconfirmed-note{opacity:0.5;font-size:0.7em;margin-left:4px;}
 </style>";
 
     static readonly string HtmlBody = @"</head><body><div class=""container"">
@@ -755,23 +955,63 @@ button:hover{border-color:var(--accent);}
         </div>
     </div>
     <div class=""header-actions"">
-        <button onclick=""if(confirm('Reset all network data and logs?')) { fetch('/api/clear_all',{method:'POST'}).then(fetchUI); }"">" + "\u21BB" + @" Network Clear</button>
+        <button onclick=""if(confirm('Reset all network data and logs?')) { fetch('/api/clear_all',{method:'POST'}).then(fetchUI); }"">" + "↻" + @" Network Clear</button>
         <button onclick=""if(confirm('Clear all offline devices from the list?')) { fetch('/api/clear_offline',{method:'POST'}).then(fetchUI); }"">" + "\U0001F5D1" + @" Clear Offline</button>
-        <button onclick=""exportCSV()"">" + "\u2B07" + @" Export CSV</button>
+        <button onclick=""exportCSV()"">" + "⬇" + @" Export CSV</button>
     </div>
 </header>
+<div id=""alertBanner""></div>
+<div class=""toolbar"">
+    <input type=""text"" id=""searchBox"" class=""search-input"" placeholder=""Search IP / MAC / Vendor..."" oninput=""applySearchFilter()"">
+</div>
 <div class=""dashboard"" id=""dash""></div>
 <div class=""grid"">
 <div class=""glass""><h3>" + "\U0001F4E1" + @" v1 Topology</h3><div id=""v1""></div></div>
 <div class=""glass""><h3>" + "\U0001F4E1" + @" v2 Topology</h3><div id=""v2""></div></div>
 </div>
-<div class=""glass""><h3>Event Logs</h3><div id=""l"" class=""logs""></div></div>
+<div class=""glass"">
+    <h3>Event Logs</h3>
+    <div class=""log-filters"" id=""logFilters"">
+        <button data-level=""ALL"" class=""active"" onclick=""setLogFilter('ALL')"">ALL</button>
+        <button data-level=""ERROR"" onclick=""setLogFilter('ERROR')"">ERROR</button>
+        <button data-level=""WARN"" onclick=""setLogFilter('WARN')"">WARN</button>
+        <button data-level=""CONFLICT"" onclick=""setLogFilter('CONFLICT')"">CONFLICT</button>
+        <button data-level=""MISMATCH"" onclick=""setLogFilter('MISMATCH')"">MISMATCH</button>
+    </div>
+    <div id=""l"" class=""logs""></div>
+</div>
 </div>";
 
     static readonly string HtmlScripts = @"<script>
 function esc(t){ if(t === 0) return '0'; if(!t) return ''; return String(t).replace(/[&<>/""']/g, s=>({'&':'&amp;','<':'&lt;','>':'&gt;','/':'&#47;','""':'&quot;',""'"":""&#39;""}[s])); }
 function valS(v) { return v === null ? 'N/A' : v; }
 function hhmmss(s) { if(s<0)return'00:00:00'; let h=Math.floor(s/3600),m=Math.floor((s%3600)/60),sec=Math.floor(s%60); return String(h).padStart(2,'0')+':'+String(m).padStart(2,'0')+':'+String(sec).padStart(2,'0'); }
+function simpleHash(s) { let h = 0; for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0; return (h >>> 0).toString(36); }
+// A sanitized-only id can collide (e.g. domains ""A-B"" and ""A_B"" both become ""A_B""); the raw-string
+// hash suffix disambiguates them so an alert's click-to-scroll always lands on the right node.
+function nodeElId(ip, ver, dom) { const raw = ip + '|' + ver + '|' + dom; return 'node_' + raw.replace(/[^a-zA-Z0-9_]/g, '_') + '_' + simpleHash(raw); }
+
+let logFilterLevel = 'ALL';
+let lastLogs = [];
+const LOG_TAG_MAP = { ERROR: '[ERROR]', WARN: '[WARN]', CONFLICT: '[CONFLICT_ALERT]', MISMATCH: '[GM_MISMATCH]' };
+function setLogFilter(level) {
+    logFilterLevel = level;
+    document.querySelectorAll('#logFilters button').forEach(b => b.classList.toggle('active', b.dataset.level === level));
+    renderLogs(lastLogs);
+}
+function renderLogs(logsArr) {
+    lastLogs = logsArr;
+    const tag = LOG_TAG_MAP[logFilterLevel];
+    const filtered = !tag ? logsArr : logsArr.filter(l => l.indexOf(tag) !== -1);
+    document.getElementById('l').innerHTML = filtered.map(log=>`<div>${esc(log)}</div>`).reverse().join('');
+}
+
+function applySearchFilter() {
+    const term = document.getElementById('searchBox').value.trim().toLowerCase();
+    document.querySelectorAll('.node[data-search]').forEach(el => {
+        el.style.display = (!term || el.dataset.search.indexOf(term) !== -1) ? '' : 'none';
+    });
+}
 
 async function fetchUI() {
     try {
@@ -782,53 +1022,73 @@ async function fetchUI() {
             if(!dev.online) return;
             counts.nodes++;
             let isL = false;
-            const domains = new Set();
-            Object.entries(dev.protocols).forEach(([ver, p]) => {
+            const domainsByVersion = {};
+            const versionsActive = new Set();
+            dev.protocols.forEach(p => {
+                // A device stays in dev.protocols after one of its instances goes stale (p.online
+                // false) until retention removes the whole device, so stats must only count
+                // instances that are actually live, not just devices that are live overall.
+                if(!p.online) return;
                 if(p.role==='Leader') isL=true;
-                if(p.role==='Follower') { if(ver==='v1') counts.v1f++; else counts.v2f++; }
+                if(p.role==='Follower') { if(p.version==='v1') counts.v1f++; else counts.v2f++; }
                 if(p.isConflict) counts.conflicts++;
-                if(p.role !== 'Unknown') domains.add(p.domain);
+                if(p.role !== 'Unknown') {
+                    versionsActive.add(p.version);
+                    if(!domainsByVersion[p.version]) domainsByVersion[p.version] = new Set();
+                    domainsByVersion[p.version].add(p.domain);
+                }
             });
             if(isL) counts.leaders++;
-            if((dev.protocols.v1 && dev.protocols.v2) || domains.size > 1) { dev.isBc = true; counts.bcs++; }
+            const multiDomain = Object.keys(domainsByVersion).some(v => domainsByVersion[v].size > 1);
+            if(versionsActive.size > 1 || multiDomain) { dev.isBc = true; counts.bcs++; }
         });
 
         const stats = [['Active Nodes', counts.nodes], ['Leaders', counts.leaders], ['v1/v2 Followers', `${counts.v1f}/${counts.v2f}`], ['Boundary Clocks (bc)', counts.bcs], ['Conflicts', counts.conflicts]];
         document.getElementById('dash').innerHTML = stats.map(s => `<div class=""dash-item""><div style=""color:#aaa"">${s[0]}</div><div class=""dash-value"">${s[1]}</div></div>`).join('');
         document.getElementById('last-update').innerText = 'Last Update: ' + new Date().toLocaleTimeString();
 
+        const alerts = [];
+
         ['v1', 'v2'].forEach(v => {
-            const domains = [...new Set(d.devices.map(dev => dev.protocols[v]?.domain).filter(x => x !== undefined))].sort();
+            const instances = [];
+            d.devices.forEach(dev => dev.protocols.forEach(p => { if (p.version === v) instances.push({dev: dev, p: p}); }));
+            const domains = [...new Set(instances.map(i => i.p.domain))].sort();
             let html = '';
-            
+
             domains.forEach(dom => {
                 html += `<div style=""margin-top:1.5rem;margin-bottom:1rem;border-bottom:1px solid var(--border);padding-bottom:5px;color:var(--accent);font-weight:bold;font-size:0.9rem;display:flex;align-items:center;gap:10px;"">
                     <svg width=""16"" height=""16"" viewBox=""0 0 24 24"" fill=""none"" stroke=""currentColor"" stroke-width=""2""><circle cx=""12"" cy=""12"" r=""10""/><path d=""M12 8v8M8 12h8""/></svg>
                     Domain ${esc(dom)}
                 </div>`;
 
-                const domainNodes = d.devices.filter(dev => dev.protocols[v] && dev.protocols[v].domain === dom);
+                const domainNodes = instances.filter(i => i.p.domain === dom);
                 const cmap = {}; const roots = []; const rendered = new Set();
 
-                domainNodes.forEach(dev => {
-                    const p = dev.protocols[v];
-                    const parentExists = p.parentIp && domainNodes.some(dn => dn.ip === p.parentIp);
-                    if (p.role === 'Leader' || !p.parentIp || !parentExists) roots.push(dev);
-                    else { if(!cmap[p.parentIp]) cmap[p.parentIp]=[]; cmap[p.parentIp].push(dev); }
+                domainNodes.forEach(inst => {
+                    const p = inst.p;
+                    const parentExists = p.parentIp && domainNodes.some(dn => dn.dev.ip === p.parentIp);
+                    if (p.role === 'Leader' || !p.parentIp || !parentExists) roots.push(inst);
+                    else { if(!cmap[p.parentIp]) cmap[p.parentIp]=[]; cmap[p.parentIp].push(inst); }
                 });
 
-                function render(dev, depth, parentGmId) {
+                function render(inst, depth, parentGmId) {
+                    const dev = inst.dev, p = inst.p;
                     if (rendered.has(dev.ip)) return ''; // Guard against circular parent links
                     rendered.add(dev.ip);
-                    const p = dev.protocols[v];
                     const role = p.role.toLowerCase();
-                    const isMismatch = (role === 'follower' && parentGmId && p.gmId && p.gmId !== parentGmId);
+                    // Only flag a mismatch when the parent link is Delay_Resp-confirmed and this
+                    // instance is currently live -- comparing against an inferred/unconfirmed fallback
+                    // parent, or a stale offline instance, would misrepresent the backend's own
+                    // (link-confirmed-only) mismatch semantics.
+                    const isMismatch = (role === 'follower' && p.online && p.linkConfirmed && parentGmId && p.gmId && p.gmId !== parentGmId);
                     const isPersistent = p.conflictSeconds >= 10;
                     const isConflict = p.conflictSeconds > 0 ? (isPersistent ? 'conflict' : 'bmca') : '';
                     const color = role === 'leader' ? '#ff7090' : (role === 'follower' ? '#5de8b8' : '#e2e8f0');
                     const indent = depth * 25;
-                    const arrow = depth > 0 ? `<span style=""color:#5de8b8;margin-right:6px;"">\u21B3</span>` : '';
-                    
+                    const arrow = depth > 0 ? `<span style=""color:#5de8b8;margin-right:6px;"">↳</span>` : '';
+                    const nodeId = nodeElId(dev.ip, p.version, p.domain);
+                    const linkUnconfirmed = (role === 'follower' && p.parentIp && !p.linkConfirmed);
+
                     // A Follower's own GM is only known when it has itself relayed an Announce/Sync
                     // (e.g. acting as a Boundary Clock on another port). For an ordinary Follower that
                     // only sends Delay_Req, p.gmId is never observed, so the value shown is inherited
@@ -837,15 +1097,20 @@ async function fetchUI() {
                     const gmInferred = (role === 'follower' && !p.gmId && !!parentGmId);
                     let gmIdText = p.gmId || (role === 'follower' ? parentGmId : 'N/A');
                     let gmStyle = isMismatch ? 'color:#ff4a4a;font-weight:bold;background:rgba(255,50,50,0.1);padding:2px 4px;border-radius:4px;' : 'opacity:0.9;';
-                    let gmLine = `<div class=""info-row"" style=""${gmStyle}margin-top:6px;font-family:monospace;"">GM: ${esc(gmIdText)}${gmInferred?' <span style=""opacity:0.6"">(inherited, unverified)</span>':''}${isMismatch?' <span style=""margin-left:4px;"">\u26A0 GM Mismatch!</span>':''}</div>`;
+                    let gmLine = `<div class=""info-row"" style=""${gmStyle}margin-top:6px;font-family:monospace;"">GM: ${esc(gmIdText)}${gmInferred?' <span class=""unconfirmed-note"">(inherited, unverified)</span>':''}${isMismatch?' <span style=""margin-left:4px;"">⚠ GM Mismatch!</span>':''}</div>`;
                     let logLine = (role === 'leader' && v === 'v2') ? `<div class=""info-row"" style=""opacity:0.7"">Sync: ${valS(p.syncLog)} / Announce: ${valS(p.announceLog)}</div>` : '';
                     let bmcLine = (role === 'leader' && v === 'v2' && p.gmPriority1 !== null) ? `<div class=""info-row"" style=""opacity:0.7"">BMC: P1=${valS(p.gmPriority1)} / Class=${valS(p.gmClass)} / P2=${valS(p.gmPriority2)}</div>` : '';
-                    
+
                     let badgeText = esc(p.role);
                     if (isConflict === 'bmca') badgeText = 'BMCA (Negotiating)';
                     else if (isPersistent) badgeText = 'CONFLICT (Persistent)';
 
-                    let res = `<div class=""node ${role} ${isConflict} ${isMismatch?'conflict':''} ${dev.online?'':'offline'}"" style=""margin-left:${indent}px"">
+                    if (isPersistent) alerts.push({ nodeId: nodeId, text: `Conflict: ${dev.ip} (${p.version}, domain ${p.domain})` });
+                    if (isMismatch) alerts.push({ nodeId: nodeId, text: `GM Mismatch: ${dev.ip} (${p.version}, domain ${p.domain})` });
+
+                    const nodeOnline = dev.online && p.online;
+                    const searchBlob = esc((dev.ip + ' ' + dev.mac + ' ' + (p.vendor || '')).toLowerCase());
+                    let res = `<div id=""${nodeId}"" class=""node ${role} ${isConflict} ${isMismatch?'conflict':''} ${nodeOnline?'':'offline'} ${linkUnconfirmed?'unconfirmed-link':''}"" style=""margin-left:${indent}px"" data-search=""${searchBlob}"">
                         <div style=""display:flex;justify-content:space-between"">
                             <div class=""mac"" style=""color:${color}"">${arrow}${esc(dev.ip)}</div>
                             <span>
@@ -853,7 +1118,7 @@ async function fetchUI() {
                                 <span class=""role-badge ${isConflict || role}"">${badgeText}${dev.isBc?' (BC)':''}</span>
                             </span>
                         </div>
-                        <div class=""info-row"">MAC: ${esc(dev.mac)} | Vendor: ${esc(p.vendor || 'Unknown')}</div>
+                        <div class=""info-row"">MAC: ${esc(dev.mac)} | Vendor: ${esc(p.vendor || 'Unknown')}${linkUnconfirmed?' <span class=""unconfirmed-note"">(parent unconfirmed)</span>':''}</div>
                         <div class=""info-row"" style=""color:${dev.online?'var(--follower)':'var(--leader)'};opacity:0.8"">
                             ${dev.online ? 'Uptime: '+hhmmss(dev.uptimeSeconds) : 'Offline: '+hhmmss(dev.idleSeconds)}
                             ${p.lastMeasuredIntervalMs ? ` | Delay Intv: <span style=""${p.lastMeasuredIntervalMs > (d.expectedDelayInterval * d.delayAlertThresholdRate * 1000) ? 'color:#ff4a4a;font-weight:bold' : ''}"">${(p.lastMeasuredIntervalMs/1000.0).toFixed(2)} s</span>` : ''}
@@ -869,12 +1134,20 @@ async function fetchUI() {
                 let domainHtml = '';
                 roots.forEach(r => domainHtml += render(r, 0, null));
                 // Orphans (unreachable via roots, e.g. circular parent refs after a leader loss) still get shown
-                domainNodes.forEach(dev => { if (!rendered.has(dev.ip)) domainHtml += render(dev, 0, null); });
+                domainNodes.forEach(inst => { if (!rendered.has(inst.dev.ip)) domainHtml += render(inst, 0, null); });
                 html += domainHtml || '<div style=""padding:1rem;color:#666;font-size:0.8rem"">No nodes in this domain</div>';
             });
             document.getElementById(v).innerHTML = html || '<div style=""padding:2rem;text-align:center;color:#666"">No PTP data detected</div>';
         });
-        document.getElementById('l').innerHTML = d.logs.map(log=>`<div>${esc(log)}</div>`).reverse().join('');
+
+        const bannerEl = document.getElementById('alertBanner');
+        bannerEl.innerHTML = alerts.length === 0 ? '' :
+            `<div class=""alert-banner""><strong>⚠ Active Alerts (${alerts.length})</strong>` +
+            alerts.map(a => `<div class=""alert-item"" onclick=""document.getElementById('${a.nodeId}') && document.getElementById('${a.nodeId}').scrollIntoView({behavior:'smooth',block:'center'})"">${esc(a.text)}</div>`).join('') +
+            `</div>`;
+
+        renderLogs(d.logs);
+        applySearchFilter();
     } catch(e) { console.error(e); }
 }
 
@@ -897,8 +1170,10 @@ function exportCSV(){
     fetch('/api/data').then(r=>r.json()).then(d=>{
         let csv = 'IP,MAC,Vendor,Online,v1_Role,v1_Domain,v2_Role,v2_Domain,Uptime,Idle\n';
         d.devices.forEach(dev => {
-            const v1 = dev.protocols.v1 || {}; const v2 = dev.protocols.v2 || {};
-            const cols = [dev.ip, dev.mac, v1.vendor||v2.vendor||'-', dev.online, v1.role||'-', v1.domain||'-', v2.role||'-', v2.domain||'-', hhmmss(dev.uptimeSeconds), hhmmss(dev.idleSeconds)];
+            const v1 = dev.protocols.filter(p=>p.version==='v1');
+            const v2 = dev.protocols.filter(p=>p.version==='v2');
+            const vendor = (v1[0] || v2[0] || {}).vendor || '-';
+            const cols = [dev.ip, dev.mac, vendor, dev.online, v1.map(p=>p.role).join('/')||'-', v1.map(p=>p.domain).join('/')||'-', v2.map(p=>p.role).join('/')||'-', v2.map(p=>p.domain).join('/')||'-', hhmmss(dev.uptimeSeconds), hhmmss(dev.idleSeconds)];
             csv += cols.map(csvEsc).join(',') + '\n';
         });
         const blob = new Blob([csv], { type: 'text/csv' });

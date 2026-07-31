@@ -1,4 +1,4 @@
-# PTPMonitor User Manual (v1.8.0)
+# PTPMonitor User Manual (v1.8.1)
 
 PTPMonitor is a specialized protocol analyzer designed to capture PTP (Precision Time Protocol) v1 / v2 traffic, visualize device status, Boundary Clock (BC) operations, and network topology for high-precision diagnostic purposes.
 

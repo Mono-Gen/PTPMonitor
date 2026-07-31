@@ -18,6 +18,16 @@ Run `PTPMonitor.exe` (requires proper configuration in `config.ini`).
 
 ## Changelog
 
+### [v1.8.1] - 2026-08-01
+#### Fixed
+- **Resource Exhaustion Guards**: Per-device (PTP version, domain) instance count is now capped (`MaxProtocolStatesPerDevice`), preventing a single spoofed source from growing memory/scan cost unbounded via arbitrary PTPv1 subdomains. The 512-device table now evicts the least-recently-seen device (LRU) instead of rejecting new ones once full, so spoofed IP churn can no longer permanently lock out real devices.
+- **Spoofed Leader/Role Hardening**: Leader-role assignment from Announce/Delay_Resp packets (v1 and v2) is now gated on the minimum packet length required to carry real content for those message types, closing a cheap fake-Leader spoof from undersized packets.
+- **Stale Role/Link Detection**: A Leader/Follower role no longer stays "online" purely because of Management/Signaling/Pdelay traffic; only role-defining packets (Sync/Announce/Delay_Req/Delay_Resp) keep it alive. A confirmed topology link now also expires if it isn't reconfirmed by a fresh Delay_Resp within a bounded window, even while its Leader stays otherwise valid.
+- **PTPv1 Subdomain Decoding**: Invalid (non-UTF-8) subdomain byte sequences now fall back to a raw hex key instead of colliding on the same replacement-character string.
+- **Web Server**: `/api/*` responses now send `Cache-Control: no-store`; unmapped paths return `404` instead of always serving the dashboard HTML.
+- **CSV Export**: Output now includes a UTF-8 BOM so older Excel versions don't mangle non-ASCII vendor names.
+- **Build Script**: `csc.exe` is now auto-detected under `Framework(64)\v*` instead of a hardcoded path/version.
+
 ### [v1.8.0] - 2026-07-15
 #### Fixed
 - **GM Mismatch Detection**: This check previously relied on a value a pure Follower never sets, so it silently never fired; it now runs only once the parent link is `Delay_Resp`-confirmed, and shows `(inherited, unverified)` when the Follower's own GM cannot be independently verified.

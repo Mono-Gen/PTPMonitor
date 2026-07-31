@@ -1,6 +1,17 @@
 # PTPMonitor Build Script (C# Console Application)
 
-$cscPath = "C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
+# Search common .NET Framework install locations rather than hardcoding one path/version, so the
+# script also works on 32-bit installs or systems with a different Framework version installed.
+$cscCandidates = @(
+    "$env:WINDIR\Microsoft.NET\Framework64\v*\csc.exe",
+    "$env:WINDIR\Microsoft.NET\Framework\v*\csc.exe"
+)
+$cscPath = $cscCandidates | ForEach-Object { Get-ChildItem -Path $_ -ErrorAction SilentlyContinue } |
+    Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
+if (-not $cscPath) {
+    Write-Host "csc.exe not found under $env:WINDIR\Microsoft.NET\Framework(64)\v*. Install .NET Framework or edit `$cscCandidates in this script." -ForegroundColor Red
+    exit 1
+}
 $outDir = "bin"
 $outFile = "$outDir\PTPMonitor.exe"
 $srcFile = "src\PTPMonitor.cs"

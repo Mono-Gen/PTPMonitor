@@ -36,6 +36,11 @@ class ProtocolState {
     // domain/version can't linger just because another instance of the same device is alive.
     public long LastSeenTicks { get; set; }
     public bool IsOnline { get; set; }
+    // Set only when a role-defining packet (Sync/Announce/Delay_Req/Delay_Resp) is seen, unlike
+    // LastSeenTicks which also advances on Management/Signaling/Pdelay traffic that carries no
+    // role information. Used to age out a stale Role instead of letting non-role traffic keep it
+    // alive indefinitely (e.g. a Leader that stopped sending Sync/Announce but still emits Management).
+    public long LastRoleSeenTicks { get; set; }
 
     public bool IsConflict { get; set; }
     public long? RoleChangedAtTicks { get; set; }
@@ -52,6 +57,7 @@ class ProtocolState {
         IsConflict = false;
         IsOnline = true;
         GmMismatchLogged = false;
+        LastRoleSeenTicks = Program.NowTicks();
     }
 }
 
@@ -113,8 +119,15 @@ class Program {
     // [CONFLICT_ALERT] is logged. Not a mutable readonly const so tests can shrink it for speed.
     static double ConflictPersistThresholdSeconds = 10.0;
     static readonly int MaxDevices = 512;         // Cap to prevent unbounded memory growth from spoofed sources
+    static readonly int MaxProtocolStatesPerDevice = 64; // Cap (version,domain) instances per device: a single spoofed IP could otherwise send arbitrary domain values to grow memory/scan cost unbounded
     static readonly int MaxRotatedLogFiles = 20;  // Cap rotated log generations to bound disk usage
+    // Confirmed topology links are re-validated on the Leader's liveness (see MonitorLoop), but a
+    // Leader that never goes offline could otherwise keep an unconfirmed-stale link alive forever;
+    // this forces periodic re-confirmation via a fresh Delay_Resp. Not a readonly const so tests can
+    // shrink it (see ConflictPersistThresholdSeconds for the same pattern).
+    static double LinkStaleAfterSeconds = 300.0;
     static bool deviceLimitWarned = false;
+    static bool protocolStateLimitWarned = false;
 
     // Composite dictionary keys are built as "version" + KeySep + "domain" [+ KeySep + "followerIp"].
     // A control character is used as the separator (rather than e.g. '|') because a v1 "domain" is
@@ -148,6 +161,19 @@ class Program {
 
     static string StateKey(string version, string domain) { return version + KeySep + domain; }
     static string LinkKey(string version, string domain, string followerIp) { return version + KeySep + domain + KeySep + followerIp; }
+
+    /// <summary>
+    /// Decodes a PTPv1 subdomain (raw bytes, not guaranteed to be valid UTF-8/text). A naive
+    /// Encoding.UTF8.GetString replaces any invalid byte sequence with U+FFFD, so two different
+    /// invalid inputs can decode to the identical string and collide as the same domain key. If the
+    /// decoded text contains the replacement character, fall back to a hex dump of the raw bytes
+    /// (distinct byte sequences stay distinct); valid text keeps its normal readable form.
+    /// </summary>
+    static string SafeDecodeDomain(byte[] data, int offset, int len) {
+        string text = Encoding.UTF8.GetString(data, offset, len).TrimEnd('\0', ' ');
+        if (text.IndexOf('�') >= 0) return "raw:" + BitConverter.ToString(data, offset, len).Replace("-", "");
+        return text;
+    }
 
     /// <summary>
     /// Entry point. Handles interface selection and starts monitoring tasks.
@@ -453,7 +479,15 @@ class Program {
             bool isEventMessage = msgType <= 3;
             if (isEventMessage && port != 319) return;
             if (!isEventMessage && port != 320) return;
-            if (msgType == 0 || msgType == 11 || msgType == 8 || msgType == 9) role = "Leader"; // Sync, Announce, Follow_Up, Delay_Resp
+            // Announce/Delay_Resp are gated on the same length already required below to read their
+            // GM/reqId fields (61/52 bytes): a packet too short to carry real Announce/Delay_Resp
+            // content is not trusted to claim Leader role either, closing a cheap fake-Leader spoof.
+            // Sync/Follow_Up have no independently-verified minimum in this file (see
+            // ai-reviewer-wire-format-verification: PTP byte-level claims are not trusted without a
+            // primary-source check), so they intentionally keep only the base 34-byte length check.
+            if (msgType == 0 || msgType == 8) role = "Leader"; // Sync, Follow_Up
+            else if (msgType == 11 && len >= 61) role = "Leader"; // Announce
+            else if (msgType == 9 && len >= 52) role = "Leader"; // Delay_Resp
             else if (msgType == 1) role = "Follower"; // Delay_Req (Pdelay_Req excluded: P2P leaders send it too)
         } else {
             if (len < 40) return;
@@ -472,9 +506,16 @@ class Program {
             bool controlIsEvent = control == 0 || control == 1;
             if (msgType == 1 && !controlIsEvent) return;
             if (msgType == 2 && controlIsEvent) return;
-            domain = Encoding.UTF8.GetString(data, 4, 16).TrimEnd('\0', ' ');
+            domain = SafeDecodeDomain(data, 4, 16);
             ownId = BitConverter.ToString(data, 22, 6).Replace("-","");
-            if (control == 0 || control == 2 || control == 3) role = "Leader"; // Sync, Follow_Up, Delay_Resp
+            // Sync/Delay_Resp are gated on the same length already required below to read their
+            // syncInterval/GM/reqId fields (84/56 bytes): a packet too short to carry real Sync/
+            // Delay_Resp content is not trusted to claim Leader role either. Follow_Up has no
+            // independently-verified minimum in this file, so it keeps only the base 40-byte check
+            // (see ai-reviewer-wire-format-verification memory: PTPv1 offsets are not guessed).
+            if (control == 0 && len >= 84) role = "Leader"; // Sync
+            else if (control == 3 && len >= 56) role = "Leader"; // Delay_Resp
+            else if (control == 2) role = "Leader"; // Follow_Up
             else if (control == 1) role = "Follower"; // Delay_Req
         }
 
@@ -486,9 +527,17 @@ class Program {
                 if (devices.Count >= MaxDevices) {
                     if (!deviceLimitWarned) {
                         deviceLimitWarned = true;
-                        Log(string.Format("[WARN] Device limit ({0}) reached; additional devices are ignored.", MaxDevices));
+                        Log(string.Format("[WARN] Device limit ({0}) reached; least-recently-seen devices are evicted for new ones.", MaxDevices));
                     }
-                    return;
+                    // Evict the least-recently-seen device instead of rejecting the new one outright:
+                    // a device that keeps sending real traffic keeps refreshing LastSeenTicks and won't
+                    // be evicted, so spoofed churn can't permanently lock the table against it, unlike a
+                    // blanket "ignore new devices" policy which a burst of spoofed IPs could hold forever.
+                    string oldestIp = null; long oldestTicks = long.MaxValue;
+                    foreach (var d in devices.Values) {
+                        if (d.LastSeenTicks < oldestTicks) { oldestTicks = d.LastSeenTicks; oldestIp = d.IP; }
+                    }
+                    if (oldestIp != null) { RemoveDeviceLinks(oldestIp); devices.Remove(oldestIp); }
                 }
                 devices[ip] = new DeviceInfo(ip);
             }
@@ -505,13 +554,25 @@ class Program {
                 else if (protoVer == "v1" && ownId.Length == 12) dev.Mac = ownId.Substring(0,2)+":"+ownId.Substring(2,2)+":"+ownId.Substring(4,2)+":"+ownId.Substring(6,2)+":"+ownId.Substring(8,2)+":"+ownId.Substring(10,2);
             }
 
-            if (!dev.Protocols.ContainsKey(stateKey)) dev.Protocols[stateKey] = new ProtocolState(protoVer, domain);
+            if (!dev.Protocols.ContainsKey(stateKey)) {
+                if (dev.Protocols.Count >= MaxProtocolStatesPerDevice) {
+                    if (!protocolStateLimitWarned) {
+                        protocolStateLimitWarned = true;
+                        Log(string.Format("[WARN] Per-device protocol-instance limit ({0}) reached for {1}; additional (version,domain) instances are ignored.", MaxProtocolStatesPerDevice, ip));
+                    }
+                    return;
+                }
+                dev.Protocols[stateKey] = new ProtocolState(protoVer, domain);
+            }
             var pState = dev.Protocols[stateKey];
             string oldRole = pState.Role;
             pState.OwnId = ownId;
             pState.LastSeenTicks = now;
-            pState.IsOnline = true;
-            if (role != "Unknown") pState.Role = role;
+            // IsOnline is only (re)asserted alongside a role-defining packet, not on every packet:
+            // otherwise non-role traffic (Management/Signaling/Pdelay) would keep re-flipping IsOnline
+            // back to true right after MonitorLoop ages it out via LastRoleSeenTicks, defeating that
+            // staleness check entirely (a stale Role must actually go offline, not just "flicker").
+            if (role != "Unknown") { pState.Role = role; pState.LastRoleSeenTicks = now; pState.IsOnline = true; }
 
             if (protoVer == "v2") {
                 sbyte logInt = unchecked((sbyte)data[33]); // v2 header: logMessageInterval
@@ -609,7 +670,11 @@ class Program {
 
                 foreach (var dev in devices.Values) {
                     foreach (var pState in dev.Protocols.Values) {
-                        if (pState.IsOnline && ElapsedSeconds(pState.LastSeenTicks) >= OfflineTimeoutSeconds) {
+                        // Uses LastRoleSeenTicks (only advanced by role-defining packets), not
+                        // LastSeenTicks (advanced by any packet including Management/Signaling/Pdelay),
+                        // so a Leader/Follower that stopped sending Sync/Announce/Delay_Req/Delay_Resp
+                        // ages out even if other non-role traffic from the same instance keeps arriving.
+                        if (pState.IsOnline && ElapsedSeconds(pState.LastRoleSeenTicks) >= OfflineTimeoutSeconds) {
                             pState.IsOnline = false;
                             pState.IsConflict = false; pState.ConflictStartedAtTicks = null; pState.GmMismatchLogged = false;
                         }
@@ -649,14 +714,19 @@ class Program {
                 }
 
                 // Expire confirmed topology links whose Leader is no longer valid (offline, or no
-                // longer Leader in that domain), then check GM-mismatch on the links that remain.
+                // longer Leader in that domain), or that haven't been reconfirmed by a fresh
+                // Delay_Resp within LinkStaleAfterSeconds, then check GM-mismatch on the links that
+                // remain. The staleness window matters because a Leader that never goes offline could
+                // otherwise let a link outlive the Follower's actual (possibly since-changed) parent
+                // indefinitely, since ConfirmedAtTicks would otherwise never be consulted again.
                 var staleLinks = new List<string>();
                 foreach (var kv in topologyLinks) {
                     var link = kv.Value;
                     string key = StateKey(link.Version, link.Domain);
-                    DeviceInfo leaderDev;
-                    ProtocolState leaderState;
-                    if (!devices.TryGetValue(link.LeaderIp, out leaderDev) || !leaderDev.Protocols.TryGetValue(key, out leaderState) || leaderState.Role != "Leader" || !leaderState.IsOnline) {
+                    DeviceInfo leaderDev = null;
+                    ProtocolState leaderState = null;
+                    bool leaderValid = devices.TryGetValue(link.LeaderIp, out leaderDev) && leaderDev.Protocols.TryGetValue(key, out leaderState) && leaderState.Role == "Leader" && leaderState.IsOnline;
+                    if (!leaderValid || ElapsedSeconds(link.ConfirmedAtTicks) >= LinkStaleAfterSeconds) {
                         staleLinks.Add(kv.Key);
                         // Reset the guard so a genuinely new mismatch (after this follower is later
                         // confirmed against a different Leader) is logged fresh instead of being
@@ -811,6 +881,8 @@ class Program {
                 return;
             }
 
+            if (path.StartsWith("/api/", StringComparison.Ordinal)) res.Headers.Add("Cache-Control", "no-store");
+
             if (path == "/api/clear_offline" && context.Request.HttpMethod == "POST") {
                 int count = 0;
                 lock(devices) {
@@ -883,11 +955,17 @@ class Program {
                 res.ContentType = "application/json";
                 res.ContentLength64 = b.Length;
                 res.OutputStream.Write(b,0,b.Length);
-            } else {
+            } else if (path == "/" || path == "/index.html") {
                 byte[] b = Encoding.UTF8.GetBytes(HtmlContent.Replace("{PORT}", WebPort));
                 res.ContentType = "text/html; charset=utf-8";
                 res.ContentLength64 = b.Length;
                 res.OutputStream.Write(b,0,b.Length);
+            } else {
+                // Only "/", the dashboard's own API paths, and the two POST endpoints above are ever
+                // requested by assets/web/*; anything else is unexpected and returns a real 404 rather
+                // than silently serving the dashboard HTML (which could mask a client-side typo or be
+                // cached as if it were a valid resource).
+                res.StatusCode = 404;
             }
         } catch (HttpListenerException) {
             // Client disconnected mid-response (reload / tab closed): abort quietly.

@@ -191,7 +191,9 @@ function exportCSV(){
             const cols = [dev.ip, dev.mac, vendor, dev.online, v1.map(p=>p.role).join('/')||'-', v1.map(p=>p.domain).join('/')||'-', v2.map(p=>p.role).join('/')||'-', v2.map(p=>p.domain).join('/')||'-', hhmmss(dev.uptimeSeconds), hhmmss(dev.idleSeconds)];
             csv += cols.map(csvEsc).join(',') + '\n';
         });
-        const blob = new Blob([csv], { type: 'text/csv' });
+        // Prepend a UTF-8 BOM: without it, older Excel versions mis-detect the encoding and
+        // mangle non-ASCII vendor names instead of reading them as UTF-8.
+        const blob = new Blob(['﻿' + csv], { type: 'text/csv' });
         const url = window.URL.createObjectURL(blob);
         const a = document.createElement('a'); a.style.display = 'none'; a.href = url;
         a.download = `ptp_monitor_export_${new Date().getTime()}.csv`;

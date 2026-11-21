@@ -62,6 +62,12 @@ class ProtocolState {
     public long? LastP2PSeenTicks { get; set; }
     // Set by MonitorLoop while this instance's (v2, domain) has persistently mixed E2E and P2P devices.
     public bool MechMismatch { get; set; }
+    // When the last (well-formed) Announce arrived. Unlike LastRoleSeenTicks it is advanced ONLY by
+    // Announce, so a Leader that keeps sending Sync but stopped Announcing is detectable.
+    public long? LastAnnounceTicks { get; set; }
+    public bool AnnounceStale { get; set; }          // set by MonitorLoop: no Announce for AnnounceReceiptTimeout intervals
+    public bool AnnounceStaleLogged { get; set; }    // edge-trigger guard for [ANNOUNCE_TIMEOUT]
+    public bool IntervalMismatch { get; set; }       // set by MonitorLoop: this domain's Leaders use different Announce intervals
 
     public bool IsConflict { get; set; }
     public long? RoleChangedAtTicks { get; set; }
@@ -161,6 +167,10 @@ class Program {
     static double ExpectedDelayInterval = 2.0;    // Added in v1.6.8
     static double DelayAlertThresholdRate = 1.5;  // Added in v1.6.8
     static double OfflineTimeoutSeconds = 10.0;   // Added in v1.6.8
+    // Number of missed Announce intervals after which a Leader that is otherwise still active is reported
+    // as having stopped announcing. Same meaning/default/range as linuxptp's announceReceiptTimeout
+    // (default 3, min 2, max 255).
+    static double AnnounceReceiptTimeout = 3.0;
     // How long two simultaneous Leaders must persist in the same (version, domain) before a
     // [CONFLICT_ALERT] is logged. Not a mutable readonly const so tests can shrink it for speed.
     static double ConflictPersistThresholdSeconds = 10.0;
@@ -192,6 +202,9 @@ class Program {
     // mechMismatchLogged is the edge-trigger guard for [DELAY_MECH_MISMATCH]. Both guarded by lock(devices).
     static Dictionary<string, long> mechMismatchSince = new Dictionary<string, long>();
     static HashSet<string> mechMismatchLogged = new HashSet<string>();
+    // Same pattern for differing Announce intervals within a (v2, domain). Guarded by lock(devices).
+    static Dictionary<string, long> intervalMismatchSince = new Dictionary<string, long>();
+    static HashSet<string> intervalMismatchLogged = new HashSet<string>();
     static CancellationTokenSource cts = new CancellationTokenSource();
     static StreamWriter logWriter = null;
     static string currentLogPath = "ptp_monitor.log";
@@ -236,7 +249,7 @@ class Program {
     /// </summary>
     static void Main(string[] args) {
         LoadConfig();
-        Console.WriteLine("=== PTPMonitor v1.11.0 ===");
+        Console.WriteLine("=== PTPMonitor v1.12.0 ===");
 
         NetworkInterface[] nics = NetworkInterface.GetAllNetworkInterfaces();
         List<IPAddress> validIps = new List<IPAddress>();
@@ -395,6 +408,8 @@ class Program {
                             ApplyConfigDouble(key, val, ref DelayAlertThresholdRate, 0.001, double.MaxValue);
                         } else if (key.Equals("OfflineTimeoutSeconds", StringComparison.OrdinalIgnoreCase)) {
                             ApplyConfigDouble(key, val, ref OfflineTimeoutSeconds, 0.001, double.MaxValue);
+                        } else if (key.Equals("AnnounceReceiptTimeout", StringComparison.OrdinalIgnoreCase)) {
+                            ApplyConfigDouble(key, val, ref AnnounceReceiptTimeout, 2.0, 255.0);
                         } else {
                             customVendors[key.ToUpper()] = val;
                         }
@@ -706,6 +721,10 @@ class Program {
             // GM was verified for the previous identity says nothing about this one.
             if (pState.OwnId != null && pState.OwnId != ownId) {
                 pState.GmVerified = false;
+                // Announce timing belongs to the previous identity: the new one must announce for itself
+                // before it can be judged (applies even while the old identity still looked online).
+                pState.LastAnnounceTicks = null; pState.AnnounceLog = null;
+                pState.AnnounceStale = false; pState.AnnounceStaleLogged = false;
                 // If the previous identity had already gone offline, the new one is a replacement device, not
                 // the old one speaking again: it must not inherit the old Role / GM / mechanism markers (a
                 // stale Leader role would otherwise also stop a role-less P2P replacement from being kept
@@ -722,6 +741,8 @@ class Program {
                     pState.GmPriority1 = null; pState.GmPriority2 = null; pState.GmClass = null;
                     pState.GmAccuracy = null; pState.GmVariance = null; pState.StepsRemoved = null;
                     pState.TimeSource = null; pState.UtcOffset = null; pState.TimeFlags = null;
+                    pState.SyncLog = null; pState.AnnounceLog = null; pState.LastAnnounceTicks = null;
+                    pState.AnnounceStale = false; pState.AnnounceStaleLogged = false;
                     pState.RoleChangedAtTicks = null;
                 }
             }
@@ -751,7 +772,9 @@ class Program {
                 sbyte logInt = unchecked((sbyte)data[33]); // v2 header: logMessageInterval
                 if (logInt != 0x7F) {
                     if (msgType == 0) pState.SyncLog = logInt;
-                    else if (msgType == 11) pState.AnnounceLog = logInt;
+                    // AnnounceLog is NOT set here: it must change together with LastAnnounceTicks, only from a
+                    // well-formed Announce (see the len >= 61 block below), or a short/spoofed Announce could
+                    // rewrite the interval the timeout is judged against.
                 }
             } else if (control == 0) { // v1 Sync message body
                 if (len >= 84) {
@@ -798,6 +821,11 @@ class Program {
 
             // GM Info from Announce (v2)
             if (protoVer == "v2" && msgType == 11 && len >= 61) {
+                pState.LastAnnounceTicks = now; // same length gate as the Leader role this Announce grants
+                // The interval is taken from this same Announce. 0x7F means "no interval given", which must
+                // REPLACE any earlier value with null (otherwise an old interval keeps being enforced).
+                sbyte annLog = unchecked((sbyte)data[33]);
+                pState.AnnounceLog = annLog != 0x7F ? (int?)annLog : null;
                 pState.GmPriority1 = data[47]; pState.GmClass = data[48]; pState.GmPriority2 = data[52];
                 // Announce body layout (IEEE 1588-2008; checked against linuxptp msg.h and Wireshark
                 // packet-ptp.c): currentUtcOffset 44-45 (signed, big-endian), clockAccuracy 49,
@@ -877,6 +905,30 @@ class Program {
                             // until a fresh Announce / v1 Sync body confirms its GM again.
                             pState.GmVerified = false;
                         }
+
+                        // Announce timeout: an ACTIVE v2 Leader (still sending Sync etc., so not offline) whose
+                        // Announces have stopped for AnnounceReceiptTimeout x its own Announce interval. This is
+                        // the early sign of a GM change that the offline timeout cannot see, since Sync keeps the
+                        // Leader "alive". The limit has a 1 s floor so sub-second intervals do not trip on jitter,
+                        // and an absurd interval (log up to +127) simply yields a limit that is never reached.
+                        bool announceStale = false;
+                        if (pState.IsOnline && pState.Version == "v2" && pState.Role == "Leader" && pState.LastAnnounceTicks.HasValue && pState.AnnounceLog.HasValue) {
+                            double annInterval = Math.Pow(2.0, pState.AnnounceLog.Value);
+                            double annLimit = Math.Max(AnnounceReceiptTimeout * annInterval, 1.0);
+                            // Count from the later of the last Announce and the moment this instance became a
+                            // Leader (again): a Follower that returns to Leader must not be judged against an
+                            // Announce from before it stopped being one.
+                            long annRef = pState.LastAnnounceTicks.Value;
+                            if (pState.RoleChangedAtTicks.HasValue && pState.RoleChangedAtTicks.Value > annRef) annRef = pState.RoleChangedAtTicks.Value;
+                            double sinceAnnounce = ElapsedSeconds(annRef);
+                            announceStale = sinceAnnounce > annLimit;
+                            if (announceStale && !pState.AnnounceStaleLogged) {
+                                pState.AnnounceStaleLogged = true;
+                                Log(string.Format("[ANNOUNCE_TIMEOUT] {0} (v2, domain {1}) Leader has sent no Announce for {2}s (limit {3}s = {4} x 2^{5}s) but is still active.", dev.IP, pState.Domain, sinceAnnounce.ToString("0.#", CultureInfo.InvariantCulture), annLimit.ToString("0.##", CultureInfo.InvariantCulture), AnnounceReceiptTimeout.ToString("0.##", CultureInfo.InvariantCulture), pState.AnnounceLog.Value));
+                            }
+                        }
+                        pState.AnnounceStale = announceStale;
+                        if (!announceStale) pState.AnnounceStaleLogged = false;
                     }
                     double idle = ElapsedSeconds(dev.LastSeenTicks);
                     if (idle >= OfflineTimeoutSeconds && dev.IsOnline) { dev.IsOnline = false; Log(string.Format("[OFFLINE] {0} ({1}) stopped responding.", GetVendorSafe(dev.Mac), dev.IP)); }
@@ -965,6 +1017,37 @@ class Program {
                     }
                 }
                 foreach (var k in mechMismatchSince.Keys.Where(k => !mixedKeys.Contains(k)).ToList()) { mechMismatchSince.Remove(k); mechMismatchLogged.Remove(k); }
+
+                // Announce-interval mismatch: the Leaders of one v2 domain announcing at different intervals.
+                // Only a WARNING: linuxptp's documentation says the Announce interval "should be the same in
+                // the whole domain", which is guidance, not a hard rule (a Boundary Clock can differ by design),
+                // so it must persist like a Conflict first. Sync intervals are NOT compared (no source states
+                // they must match). Leaders already reported as not announcing are left out (stale value).
+                var annGroups = new Dictionary<string, List<ProtocolState>>();
+                foreach (var dev in devices.Values) {
+                    foreach (var pState in dev.Protocols.Values) {
+                        pState.IntervalMismatch = false;
+                        if (pState.Version != "v2" || !pState.IsOnline || pState.Role != "Leader" || !pState.AnnounceLog.HasValue || pState.AnnounceStale) continue;
+                        string akey = StateKey(pState.Version, pState.Domain);
+                        List<ProtocolState> alist;
+                        if (!annGroups.TryGetValue(akey, out alist)) { alist = new List<ProtocolState>(); annGroups[akey] = alist; }
+                        alist.Add(pState);
+                    }
+                }
+                var intervalKeys = new HashSet<string>();
+                foreach (var ag in annGroups) {
+                    var logs = new SortedSet<int>();
+                    foreach (var pState in ag.Value) logs.Add(pState.AnnounceLog.Value);
+                    if (logs.Count < 2) continue;
+                    intervalKeys.Add(ag.Key);
+                    long sinceI;
+                    if (!intervalMismatchSince.TryGetValue(ag.Key, out sinceI)) { sinceI = now; intervalMismatchSince[ag.Key] = sinceI; }
+                    if (ElapsedSeconds(sinceI) >= ConflictPersistThresholdSeconds) {
+                        foreach (var pState in ag.Value) pState.IntervalMismatch = true;
+                        if (intervalMismatchLogged.Add(ag.Key)) Log(string.Format("[INTERVAL_MISMATCH] Domain {0} ({1}): Leaders announce at different intervals ({2}); the Announce interval should be the same across a domain.", ag.Value[0].Domain, ag.Value[0].Version, string.Join(", ", logs.Select(l => "2^" + l.ToString(CultureInfo.InvariantCulture) + " s").ToArray())));
+                    }
+                }
+                foreach (var k in intervalMismatchSince.Keys.Where(k => !intervalKeys.Contains(k)).ToList()) { intervalMismatchSince.Remove(k); intervalMismatchLogged.Remove(k); }
 
                 // Expire confirmed topology links whose Leader is no longer valid (offline, or no
                 // longer Leader in that domain), or that haven't been reconfirmed by a fresh
@@ -1165,7 +1248,7 @@ class Program {
                 Log(string.Format("[SYSTEM] Offline devices cleared by WebUI ({0} nodes).", count));
                 res.StatusCode = 200;
             } else if (path == "/api/clear_all" && context.Request.HttpMethod == "POST") {
-                lock(devices) { devices.Clear(); topologyLinks.Clear(); domainGms.Clear(); gmHistoryLimitWarned = false; mechMismatchSince.Clear(); mechMismatchLogged.Clear(); }
+                lock(devices) { devices.Clear(); topologyLinks.Clear(); domainGms.Clear(); gmHistoryLimitWarned = false; mechMismatchSince.Clear(); mechMismatchLogged.Clear(); intervalMismatchSince.Clear(); intervalMismatchLogged.Clear(); }
                 lock(logLock) { logs.Clear(); }
                 Log("[SYSTEM] Network state and logs cleared by WebUI.");
                 res.StatusCode = 200;
@@ -1210,6 +1293,8 @@ class Program {
                             sb.Append(",\"timeProps\":").Append(JsonTimeProps(pState.TimeFlags));
                             sb.Append(",\"delayMech\":").Append(JsonStr(DelayMech(pState)));
                             sb.Append(",\"mechMismatch\":").Append(pState.MechMismatch?"true":"false");
+                            sb.Append(",\"announceStale\":").Append(pState.AnnounceStale?"true":"false");
+                            sb.Append(",\"intervalMismatch\":").Append(pState.IntervalMismatch?"true":"false");
                             sb.Append(",\"vendor\":").Append(JsonStr(GetVendorSafe(dev.Mac))).Append(",");
                             sb.Append("\"gmPriority1\":").Append(pState.GmPriority1.HasValue ? pState.GmPriority1.Value.ToString() : "null").Append(",");
                             sb.Append("\"gmClass\":").Append(pState.GmClass.HasValue ? pState.GmClass.Value.ToString() : "null").Append(",");

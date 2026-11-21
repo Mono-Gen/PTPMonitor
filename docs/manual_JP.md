@@ -1,4 +1,4 @@
-# PTPMonitor 使用説明書 (v1.11.0)
+# PTPMonitor 使用説明書 (v1.12.0)
 
 PTPMonitor は、ネットワーク上の PTP (Precision Time Protocol) v1 / v2 通信をキャプチャし、デバイスの稼働状況や Boundary Clock (BC) の動作、トポロジーを可視化・診断する「運用特化型プロトコルアナライザー」です。
 
@@ -61,11 +61,19 @@ Announce を送信した PTPv2 の Leader ノードには、`BMC:` 行の下に�
 - 値は、そのノードから**最後に受信した Announce** のものです。受信するまでは `N/A` で、`stepsRemoved` は 63 バイト以上、`timeSource` は 64 バイトの完全な Announce が必要です。行にマウスを重ねると内容の説明が表示されます。
 - 表示のみで、これらの値からアラートは出しません。「なぜこの GM が選ばれたか」の順位表示も行いません。Best Master Clock アルゴリズムの比較順がプロファイル（既定・ITU-T G.8275 など）で異なるためです。
 
+### 9. Announce タイムアウトと Announce 間隔の不一致
+どちらも**警告**です（黄色のバッジ、警告バナー、エピソードごとに1回のログ、`ANNOUNCE` / `INTERVAL` ログフィルタ）。
+- **Announce タイムアウト**（`[ANNOUNCE_TIMEOUT]`、バッジ `NO ANNOUNCE`）: PTPv2 の Leader が、まだ動作中（Sync などを送り続けているためオフライン判定は働かない）にもかかわらず、`AnnounceReceiptTimeout` × 自身の Announce 間隔（Announce から読み取った `2^logMessageInterval` 秒）の間 Announce を送っていない状態です。Grandmaster 交代の前兆になります。上限値は最低 1 秒で（1秒未満の間隔がネットワークの揺らぎで誤検知されないため）、Announce に間隔の指定がない（0x7F）Leader は判定しません。完全に通信が止まった Leader はタイムアウトではなくオフラインとして扱います。Announce が再び届くと解除されます。
+- **Announce 間隔の不一致**（`[INTERVAL_MISMATCH]`、バッジ `INTERVAL`）: 同一 PTPv2 ドメインの Leader 同士の Announce 間隔が、保持時間（Conflict と同じ10秒）の間異なる状態です。ログに検出した間隔を列挙します。これは linuxptp の「Announce 間隔はドメイン全体で同じにすべき」という指針に基づくもので、厳密な規則ではない（Boundary Clock が意図的に異なる構成もあり得る）ため、警告に留めます。**Sync 間隔は比較しません**。一致が必要と述べる情報源がないためです。
+
+> [!NOTE]
+> Announce 間隔が長い場合（例: 16秒）、上限値は 3 × 16 = 48 秒です。Leader が役割判定用の通信（Sync・Announce など）をすべて止めた場合は、その前にオフライン判定時間でオフライン表示になります。Sync を送り続けている場合は、Announce なしで48秒が経過した時点で報告されます。
+
 ## WebUI の操作
 - **Uptime / Offline**: 各デバイスの直近の稼働時間、または切断後の経過時間をリアルタイム表示します。オフラインから復帰するとUptimeがリセットされ、`[REJOIN]` ログが記録されます。
 - **検索/フィルタ**: 画面上部の検索ボックスにIP・MAC・ベンダー名を入力すると、該当するノードのみを絞り込み表示します。
 - **警告バナー**: トポロジー表示の上部に、現在発生中のConflict/GM不一致アラートが一覧表示されます。クリックすると該当ノードまでスクロールします。
-- **ログレベルフィルタ**: イベントログ欄は `ALL` / `ERROR` / `WARN` / `CONFLICT` / `MISMATCH`（GM不一致）/ `DELAY`（E2E/P2P混在）で絞り込み表示できます。
+- **ログレベルフィルタ**: イベントログ欄は `ALL` / `ERROR` / `WARN` / `CONFLICT` / `MISMATCH`（GM不一致）/ `DELAY`（E2E/P2P混在）/ `ANNOUNCE`（Announce タイムアウト）/ `INTERVAL`（Announce 間隔不一致）で絞り込み表示できます。
 - `🗑 Clear Offline`: オフライン機器を一括削除します。
 - `↻ Network Clear`: 全データ（メモリおよびログ）をリセットして監視を再開します。
 - **統計パネル**: ネットワーク内で現在「オンライン」の機器のみをカウントして表示します。
@@ -81,6 +89,7 @@ Announce を送信した PTPv2 の Leader ノードには、`BMC:` 行の下に�
 - **ExpectedDelayInterval**: Follower の `Delay_Req` の期待間隔（秒）。
 - **DelayAlertThresholdRate**: アラートを出す倍率（デフォルト 1.5）。実際の間隔が 「期待値 × 倍率」 を超えると赤字警告。
 - **OfflineTimeoutSeconds**: オフライン判定までの無通信時間（デフォルト 10.0秒）。
+- **AnnounceReceiptTimeout**: 動作中の Leader が Announce を送っていないと報告するまでの、Announce 間隔の欠落回数（デフォルト 3、範囲 2〜255。linuxptp の `announceReceiptTimeout` と同じ意味・既定値）。範囲外の値は無視されます。
 - **OUI Vendor Mapping**: MACアドレスの先頭（OUI）に基づくベンダー名の定義。
 - **Specific Device Mapping**: 特定のMACアドレスに対して、ホスト名や機器名を個別に割り当て可能。
 

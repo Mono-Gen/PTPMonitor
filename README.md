@@ -18,6 +18,14 @@ Run `PTPMonitor.exe` (requires proper configuration in `config.ini`).
 
 ## Changelog
 
+### [v1.11.0] - 2026-11-21
+#### Added
+- **Announce clock quality & time properties (PTPv2 Leaders)**: new `Clock:` (accuracy, offsetScaledLogVariance, timeSource, stepsRemoved) and `Time:` (currentUtcOffset, leap61/leap59, UTC-offset-valid, PTP/ARB timescale, time/frequency-traceable) lines in the dashboard, with the values in `/api/data` (`gmAccuracy`, `gmVariance`, `stepsRemoved`, `timeSource`, `utcOffset`, `timeProps`). Raw values are always shown; names are only given for accuracy/timeSource values confirmed against Wireshark's dissector tables (others show `0xNN (unrecognized)`), and `clockClass` stays numeric. Display only: no alert and no BMCA "why this GM" ranking (the comparison order is profile-dependent).
+- `currentUtcOffset` is read as a signed 16-bit value; `stepsRemoved` needs an Announce of at least 63 bytes and `timeSource` the full 64 bytes (shorter packets leave them `N/A`), so a short packet never yields a misread value.
+#### Fixed
+- When a replacement clock identity appears behind an offline instance's IP, all Announce-derived values (including the existing `Priority1/ClockClass/Priority2`) are now reset instead of being inherited.
+- Verified only with hand-built packets, not on a live network.
+
 ### [v1.10.0] - 2026-11-21
 #### Added
 - **Delay Mechanism Detection (PTPv2)**: Each node now shows whether it uses E2E (`Delay_Req`/`Delay_Resp`) or P2P (`Pdelay_*`), in a `Delay:` line (`/api/data` → `delayMech`). A mechanism counts only while seen within `OfflineTimeoutSeconds`.

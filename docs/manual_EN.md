@@ -1,4 +1,4 @@
-# PTPMonitor User Manual (v1.10.0)
+# PTPMonitor User Manual (v1.11.0)
 
 PTPMonitor is a specialized protocol analyzer designed to capture PTP (Precision Time Protocol) v1 / v2 traffic, visualize device status, Boundary Clock (BC) operations, and network topology for high-precision diagnostic purposes.
 
@@ -49,6 +49,17 @@ A node that only sends peer-delay traffic is labeled `P2P node` instead of `Unkn
 
 > [!NOTE]
 > P2P detection requires the peer-delay multicast group to reach this PC (IGMP membership on the switch port). It has been verified only against hand-built packets, not on a live network.
+
+### 8. Announce Clock Quality and Time Properties
+PTPv2 Leader nodes that have sent an Announce show two more lines under `BMC:`:
+- `Clock: Accuracy ... / Variance 0x.... / Source ... / Steps removed N` — `clockAccuracy`, `offsetScaledLogVariance`, `timeSource` and `stepsRemoved` (how many hops the Announce is from the Grandmaster).
+- `Time: UTC offset ... s (valid | NOT valid) / PTP timescale | ARB timescale / time-traceable ✓✗ / freq-traceable ✓✗ [/ leap61] [/ leap59]` — `currentUtcOffset` (signed seconds) and the time-property flags of the Announce.
+
+Notes:
+- Raw values are always shown. Accuracy and time-source names are only shown for values confirmed against Wireshark's PTP dissector tables; any other value is shown as `0xNN (unrecognized)`. **`clockClass` is shown only as a number** (it appears on the `BMC:` line): its meaning depends on the profile and is not interpreted here.
+- A `✗` means "not set", not a fault; for example a non-PTP timescale is normal in some profiles.
+- Values are those of the **last Announce** from the node; a field is `N/A` until it has been received (`stepsRemoved` needs an Announce of at least 63 bytes, `timeSource` the full 64 bytes). Hovering a line shows what it contains.
+- This is display only: no alert is raised from these values, and no "why this GM was chosen" ranking is shown, because the comparison order of the Best Master Clock algorithm differs between profiles (e.g. default vs. ITU-T G.8275).
 
 ## WebUI Operations
 - **Uptime / Offline**: Real-time display of uptime for active devices or elapsed time since disconnection for offline devices. Uptime resets (and a `[REJOIN]` log entry is added) when a device comes back online after being offline.

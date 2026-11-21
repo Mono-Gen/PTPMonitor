@@ -1,4 +1,4 @@
-# PTPMonitor User Manual (v1.11.0)
+# PTPMonitor User Manual (v1.12.0)
 
 PTPMonitor is a specialized protocol analyzer designed to capture PTP (Precision Time Protocol) v1 / v2 traffic, visualize device status, Boundary Clock (BC) operations, and network topology for high-precision diagnostic purposes.
 
@@ -61,11 +61,19 @@ Notes:
 - Values are those of the **last Announce** from the node; a field is `N/A` until it has been received (`stepsRemoved` needs an Announce of at least 63 bytes, `timeSource` the full 64 bytes). Hovering a line shows what it contains.
 - This is display only: no alert is raised from these values, and no "why this GM was chosen" ranking is shown, because the comparison order of the Best Master Clock algorithm differs between profiles (e.g. default vs. ITU-T G.8275).
 
+### 9. Announce Timeout and Announce-Interval Mismatch
+Both are **warnings** (yellow badge, alert-banner entry, one log line per episode, `ANNOUNCE` / `INTERVAL` log filters).
+- **Announce timeout** (`[ANNOUNCE_TIMEOUT]`, badge `NO ANNOUNCE`): a PTPv2 Leader that is still active (it keeps sending Sync etc., so the offline timeout does not trigger) but has sent no Announce for `AnnounceReceiptTimeout` × its own Announce interval (`2^logMessageInterval` seconds, taken from its Announce). This is an early sign of a Grandmaster change. The limit never goes below 1 s (so sub-second intervals do not trip on network jitter), a Leader whose Announce carries no interval (0x7F) is never judged, and a Leader that goes fully offline is reported as offline, not as timed out. It clears when an Announce arrives again.
+- **Announce-interval mismatch** (`[INTERVAL_MISMATCH]`, badge `INTERVAL`): Leaders of the same PTPv2 domain announce at different intervals for the persistence time (the same 10 s as a Conflict). The log lists the intervals found. This follows linuxptp's guidance that the Announce interval "should be the same in the whole domain"; it is guidance, not a hard rule (a Boundary Clock may differ by design), hence only a warning. **Sync intervals are not compared**, because no source states that they must match.
+
+> [!NOTE]
+> With a long Announce interval (e.g. 16 s) the limit is 3 × 16 = 48 s. If the Leader stops all role-defining traffic (Sync, Announce, ...) it is shown as offline after the offline timeout, long before that; if it keeps sending Sync, it is reported once 48 s pass without an Announce.
+
 ## WebUI Operations
 - **Uptime / Offline**: Real-time display of uptime for active devices or elapsed time since disconnection for offline devices. Uptime resets (and a `[REJOIN]` log entry is added) when a device comes back online after being offline.
 - **Search / Filter**: The search box at the top filters visible nodes by IP, MAC, or vendor as you type.
 - **Alert Banner**: A banner above the topology view lists all active Conflict/GM Mismatch alerts; clicking an entry scrolls to and highlights the corresponding node.
-- **Log Level Filters**: The Event Logs panel can be filtered to `ALL` / `ERROR` / `WARN` / `CONFLICT` / `MISMATCH` (GM mismatch) / `DELAY` (E2E/P2P mixing) entries only.
+- **Log Level Filters**: The Event Logs panel can be filtered to `ALL` / `ERROR` / `WARN` / `CONFLICT` / `MISMATCH` (GM mismatch) / `DELAY` (E2E/P2P mixing) / `ANNOUNCE` (Announce timeout) / `INTERVAL` (Announce-interval mismatch) entries only.
 - `🗑 Clear Offline`: Batch delete all offline devices.
 - `↻ Network Clear`: Reset all data (memory and logs) and restart monitoring.
 - **Statistics Panel**: Counts and displays only currently ""online"" devices in the network.
@@ -81,6 +89,7 @@ Notes:
 - **ExpectedDelayInterval**: Expected interval for Follower `Delay_Req` packets (seconds). Used as a baseline for alerting.
 - **DelayAlertThresholdRate**: Tolerance multiplier for alerting (default 1.5). UI highlights red if actual interval > (Expected * Rate).
 - **OfflineTimeoutSeconds**: Seconds of inactivity before a node is marked as offline (default 10.0s).
+- **AnnounceReceiptTimeout**: Number of missed Announce intervals before an otherwise active Leader is reported as not announcing (default 3, range 2–255; same meaning and default as linuxptp's `announceReceiptTimeout`). Out-of-range values are ignored.
 - **OUI Vendor Mapping**: Vendor name definitions based on MAC address prefix (OUI).
 - **Specific Device Mapping**: Manually assign names or hostnames to specific MAC addresses.
 

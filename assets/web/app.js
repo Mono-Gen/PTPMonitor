@@ -48,7 +48,7 @@ function timePropsText(tp, utcOffset) {
 
 let logFilterLevel = 'ALL';
 let lastLogs = [];
-const LOG_TAG_MAP = { ERROR: '[ERROR]', WARN: '[WARN]', CONFLICT: '[CONFLICT_ALERT]', MISMATCH: '[GM_MISMATCH]', DELAY: '[DELAY_MECH_MISMATCH]' };
+const LOG_TAG_MAP = { ERROR: '[ERROR]', WARN: '[WARN]', CONFLICT: '[CONFLICT_ALERT]', MISMATCH: '[GM_MISMATCH]', DELAY: '[DELAY_MECH_MISMATCH]', ANNOUNCE: '[ANNOUNCE_TIMEOUT]', INTERVAL: '[INTERVAL_MISMATCH]' };
 function setLogFilter(level) {
     logFilterLevel = level;
     document.querySelectorAll('#logFilters button').forEach(b => b.classList.toggle('active', b.dataset.level === level));
@@ -114,6 +114,7 @@ async function fetchUI() {
 
         const alerts = [];
         const mechAlerted = new Set(); // one banner entry per mixed (version, domain), not per node
+        const intervalAlerted = new Set(); // likewise for differing Announce intervals
 
         ['v1', 'v2'].forEach(v => {
             const instances = [];
@@ -202,15 +203,22 @@ async function fetchUI() {
                         mechAlerted.add(v + '|' + p.domain);
                         alerts.push({ nodeId: nodeId, warn: true, text: `Delay mechanism mismatch: E2E and P2P mixed in domain ${p.domain} (${p.version})` });
                     }
+                    if (p.announceStale) alerts.push({ nodeId: nodeId, warn: true, text: `Announce timeout: ${dev.ip} (${p.version}, domain ${p.domain}) is still active but has stopped sending Announce` });
+                    if (p.intervalMismatch && !intervalAlerted.has(v + '|' + p.domain)) {
+                        intervalAlerted.add(v + '|' + p.domain);
+                        alerts.push({ nodeId: nodeId, warn: true, text: `Announce interval mismatch: Leaders in domain ${p.domain} (${p.version}) use different Announce intervals` });
+                    }
 
                     const nodeOnline = dev.online && p.online;
                     const searchBlob = esc((dev.ip + ' ' + dev.mac + ' ' + (p.vendor || '')).toLowerCase());
-                    let res = `<div id="${nodeId}" class="node ${role} ${isConflict} ${isMismatch?'conflict':''} ${nodeOnline?'':'offline'} ${linkUnconfirmed?'unconfirmed-link':''} ${p.mechMismatch?'mech-warn':''}" style="margin-left:${indent}px" data-search="${searchBlob}">
+                    let res = `<div id="${nodeId}" class="node ${role} ${isConflict} ${isMismatch?'conflict':''} ${nodeOnline?'':'offline'} ${linkUnconfirmed?'unconfirmed-link':''} ${(p.mechMismatch || p.announceStale || p.intervalMismatch) ? 'mech-warn' : ''}" style="margin-left:${indent}px" data-search="${searchBlob}">
                         <div style="display:flex;justify-content:space-between">
                             <div class="mac" style="color:${color}">${arrow}${esc(dev.ip)}</div>
                             <span>
                                 ${isMismatch?'<span class="role-badge conflict">MISMATCH</span>':''}
                                 ${p.mechMismatch?'<span class="role-badge bmca">DELAY MIX</span>':''}
+                                ${p.announceStale?'<span class="role-badge bmca">NO ANNOUNCE</span>':''}
+                                ${p.intervalMismatch?'<span class="role-badge bmca">INTERVAL</span>':''}
                                 <span class="role-badge ${isConflict || role}">${badgeText}${dev.isBc?' (BC)':''}</span>
                             </span>
                         </div>

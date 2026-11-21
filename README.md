@@ -18,6 +18,15 @@ Run `PTPMonitor.exe` (requires proper configuration in `config.ini`).
 
 ## Changelog
 
+### [v1.12.0] - 2026-11-21
+#### Added
+- **Announce timeout warning**: a PTPv2 Leader that is still active (e.g. still sending Sync, so the offline timeout cannot fire) but has sent no Announce for `AnnounceReceiptTimeout` × its own Announce interval gets a `NO ANNOUNCE` badge, an alert-banner entry and one `[ANNOUNCE_TIMEOUT]` log per episode (`/api/data` → `announceStale`). A 1 s floor avoids false alarms for sub-second intervals; Leaders whose Announce carries no interval (0x7F) are never judged.
+- **Announce-interval mismatch warning**: Leaders of one PTPv2 domain announcing at different intervals for the persistence time raise `INTERVAL` and one `[INTERVAL_MISMATCH]` log listing the intervals (`intervalMismatch`). Warning only (linuxptp says the interval "should be the same in the whole domain"); Sync intervals are deliberately not compared, as no source says they must match.
+- New `config.ini` key `AnnounceReceiptTimeout` (default 3, range 2–255, same as linuxptp); `ANNOUNCE` / `INTERVAL` log filters.
+#### Fixed
+- A replacement clock identity now also resets the previous identity's Sync/Announce intervals and Announce timing.
+- Verified only with hand-built packets, not on a live network.
+
 ### [v1.11.0] - 2026-11-21
 #### Added
 - **Announce clock quality & time properties (PTPv2 Leaders)**: new `Clock:` (accuracy, offsetScaledLogVariance, timeSource, stepsRemoved) and `Time:` (currentUtcOffset, leap61/leap59, UTC-offset-valid, PTP/ARB timescale, time/frequency-traceable) lines in the dashboard, with the values in `/api/data` (`gmAccuracy`, `gmVariance`, `stepsRemoved`, `timeSource`, `utcOffset`, `timeProps`). Raw values are always shown; names are only given for accuracy/timeSource values confirmed against Wireshark's dissector tables (others show `0xNN (unrecognized)`), and `clockClass` stays numeric. Display only: no alert and no BMCA "why this GM" ranking (the comparison order is profile-dependent).

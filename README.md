@@ -18,6 +18,15 @@ Run `PTPMonitor.exe` (requires proper configuration in `config.ini`).
 
 ## Changelog
 
+### [v1.10.0] - 2026-11-21
+#### Added
+- **Delay Mechanism Detection (PTPv2)**: Each node now shows whether it uses E2E (`Delay_Req`/`Delay_Resp`) or P2P (`Pdelay_*`), in a `Delay:` line (`/api/data` → `delayMech`). A mechanism counts only while seen within `OfflineTimeoutSeconds`.
+- **E2E/P2P Mixing Warning**: Devices using E2E and P2P together in one domain for the persistence time raise a yellow `DELAY MIX` badge, an alert-banner entry and a one-per-episode `[DELAY_MECH_MISMATCH]` log (new `DELAY` log filter). It is a warning, not a fault.
+- **Peer-delay multicast group**: The tool now also joins `224.0.0.107`, the group Pdelay messages use; before this, P2P devices were not received at all. A failed join logs a `[WARN]` and leaves E2E monitoring unaffected.
+#### Fixed
+- A device that only sends peer-delay traffic is labeled `P2P node` and stays online while that traffic continues (it previously fell to "offline" after the timeout because it sends no role-defining packets). Roles are still never inferred from Pdelay, and a Leader/Follower is still kept alive only by role-defining packets.
+- Verified only with hand-built packets, not on a live network.
+
 ### [v1.9.0] - 2026-11-21
 #### Fixed
 - **Conflict False Positives with Boundary Clocks**: A conflict was previously raised whenever 2+ Leaders existed in the same (version, domain), which is the normal state of a GM plus a Boundary Clock. It now requires 2+ *distinct wire-verified Grandmaster IDs* (from Announce / v1 Sync body). Leaders whose GM has not yet been read are excluded until it is.

@@ -46,6 +46,24 @@ function timePropsText(tp, utcOffset) {
     return parts.join(' / ');
 }
 
+// <profileHint>
+// A HINT about which PTP profile a domain number matches, never a verdict: the domain number is set by the
+// user and several profiles share defaults (0 is common). Only values confirmed from vendor/standards-body
+// documentation are listed (SMPTE ST 2059-2 default 127; AES67 default 0; ITU-T G.8275.1 range 24-43,
+// G.8275.2 range 44-63). The IEEE 1588 default profile's default domain and Dante's PTPv1 subdomain names
+// are NOT confirmed, so they are not interpreted. Returns null when there is nothing safe to say.
+function profileHint(version, domain) {
+    if (version === 'v1') return "PTPv1 (IEEE 1588-2002): Dante's default clocking";
+    if (version !== 'v2' || !/^\d+$/.test(String(domain))) return null;
+    const n = Number(domain);
+    if (n === 127) return 'SMPTE ST 2059-2 default domain';
+    if (n === 0) return 'AES67 default domain (also used by other profiles)';
+    if (n >= 24 && n <= 43) return 'within the ITU-T G.8275.1 range (default 24)';
+    if (n >= 44 && n <= 63) return 'within the ITU-T G.8275.2 range (default 44)';
+    return null;
+}
+// </profileHint>
+
 let logFilterLevel = 'ALL';
 let lastLogs = [];
 const LOG_TAG_MAP = { ERROR: '[ERROR]', WARN: '[WARN]', CONFLICT: '[CONFLICT_ALERT]', MISMATCH: '[GM_MISMATCH]', DELAY: '[DELAY_MECH_MISMATCH]', ANNOUNCE: '[ANNOUNCE_TIMEOUT]', INTERVAL: '[INTERVAL_MISMATCH]' };
@@ -123,9 +141,11 @@ async function fetchUI() {
             let html = '';
 
             domains.forEach(dom => {
+                const hint = profileHint(v, dom);
+                const hintHtml = hint ? `<span class="profile-hint" title="A hint from the domain number only, not a detection result">hint: ${esc(hint)}</span>` : '';
                 html += `<div style="margin-top:1.5rem;margin-bottom:1rem;border-bottom:1px solid var(--border);padding-bottom:5px;color:var(--accent);font-weight:bold;font-size:0.9rem;display:flex;align-items:center;gap:10px;">
                     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 8v8M8 12h8"/></svg>
-                    Domain ${esc(dom)}
+                    Domain ${esc(dom)}${hintHtml}
                 </div>`;
 
                 // Recent GM changes for this (version, domain), newest first. Collapsed by default so a

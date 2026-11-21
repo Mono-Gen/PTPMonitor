@@ -35,5 +35,7 @@ button:hover{border-color:var(--accent);}
 .log-filters{display:flex;gap:6px;margin-bottom:0.5rem;}
 .log-filters button.active{border-color:var(--accent);color:var(--accent);}
 .unconfirmed-note{opacity:0.5;font-size:0.7em;margin-left:4px;}
+.node.mech-warn:not(.conflict){border:1px solid #ffcc00;}
+.alert-item.warn{color:#ffcc00;}
 .gm-history{margin-bottom:0.8rem;font-size:0.8rem;color:#aaa;}
 .gm-history summary{cursor:pointer;color:#ffcc00;}

@@ -8,7 +8,7 @@ function nodeElId(ip, ver, dom) { const raw = ip + '|' + ver + '|' + dom; return
 
 let logFilterLevel = 'ALL';
 let lastLogs = [];
-const LOG_TAG_MAP = { ERROR: '[ERROR]', WARN: '[WARN]', CONFLICT: '[CONFLICT_ALERT]', MISMATCH: '[GM_MISMATCH]' };
+const LOG_TAG_MAP = { ERROR: '[ERROR]', WARN: '[WARN]', CONFLICT: '[CONFLICT_ALERT]', MISMATCH: '[GM_MISMATCH]', DELAY: '[DELAY_MECH_MISMATCH]' };
 function setLogFilter(level) {
     logFilterLevel = level;
     document.querySelectorAll('#logFilters button').forEach(b => b.classList.toggle('active', b.dataset.level === level));
@@ -73,6 +73,7 @@ async function fetchUI() {
         document.getElementById('last-update').innerText = 'Last Update: ' + new Date().toLocaleTimeString();
 
         const alerts = [];
+        const mechAlerted = new Set(); // one banner entry per mixed (version, domain), not per node
 
         ['v1', 'v2'].forEach(v => {
             const instances = [];
@@ -139,20 +140,31 @@ async function fetchUI() {
                     let logLine = (role === 'leader' && v === 'v2') ? `<div class="info-row" style="opacity:0.7">Sync: ${valS(p.syncLog)} / Announce: ${valS(p.announceLog)}</div>` : '';
                     let bmcLine = (role === 'leader' && v === 'v2' && p.gmPriority1 !== null) ? `<div class="info-row" style="opacity:0.7">BMC: P1=${valS(p.gmPriority1)} / Class=${valS(p.gmClass)} / P2=${valS(p.gmPriority2)}</div>` : '';
 
+                    // Delay mechanism (E2E / P2P) is only reported for v2. An instance with no role that only
+                    // does peer-delay is a P2P node, not "Unknown".
+                    const mechLabels = { 'E2E': 'E2E (Delay_Req/Resp)', 'P2P': 'P2P (peer delay)', 'E2E+P2P': 'E2E + P2P ⚠' };
+                    const mechLine = p.delayMech ? `<div class="info-row" style="${p.mechMismatch ? 'color:#ffcc00;opacity:1;' : 'opacity:0.7'}">Delay: ${esc(mechLabels[p.delayMech] || p.delayMech)}${p.mechMismatch ? ' <span style="margin-left:4px;">⚠ E2E/P2P mixed in this domain</span>' : ''}</div>` : '';
+
                     let badgeText = esc(p.role);
                     if (isConflict === 'bmca') badgeText = 'BMCA (Negotiating)';
                     else if (isPersistent) badgeText = 'CONFLICT (Persistent)';
+                    else if (role === 'unknown' && p.delayMech === 'P2P') badgeText = 'P2P node';
 
                     if (isPersistent) alerts.push({ nodeId: nodeId, text: `Conflict: ${dev.ip} (${p.version}, domain ${p.domain})` });
                     if (isMismatch) alerts.push({ nodeId: nodeId, text: `GM Mismatch: ${dev.ip} (${p.version}, domain ${p.domain})` });
+                    if (p.mechMismatch && !mechAlerted.has(v + '|' + p.domain)) {
+                        mechAlerted.add(v + '|' + p.domain);
+                        alerts.push({ nodeId: nodeId, warn: true, text: `Delay mechanism mismatch: E2E and P2P mixed in domain ${p.domain} (${p.version})` });
+                    }
 
                     const nodeOnline = dev.online && p.online;
                     const searchBlob = esc((dev.ip + ' ' + dev.mac + ' ' + (p.vendor || '')).toLowerCase());
-                    let res = `<div id="${nodeId}" class="node ${role} ${isConflict} ${isMismatch?'conflict':''} ${nodeOnline?'':'offline'} ${linkUnconfirmed?'unconfirmed-link':''}" style="margin-left:${indent}px" data-search="${searchBlob}">
+                    let res = `<div id="${nodeId}" class="node ${role} ${isConflict} ${isMismatch?'conflict':''} ${nodeOnline?'':'offline'} ${linkUnconfirmed?'unconfirmed-link':''} ${p.mechMismatch?'mech-warn':''}" style="margin-left:${indent}px" data-search="${searchBlob}">
                         <div style="display:flex;justify-content:space-between">
                             <div class="mac" style="color:${color}">${arrow}${esc(dev.ip)}</div>
                             <span>
                                 ${isMismatch?'<span class="role-badge conflict">MISMATCH</span>':''}
+                                ${p.mechMismatch?'<span class="role-badge bmca">DELAY MIX</span>':''}
                                 <span class="role-badge ${isConflict || role}">${badgeText}${dev.isBc?' (BC)':''}</span>
                             </span>
                         </div>
@@ -164,6 +176,7 @@ async function fetchUI() {
                         ${gmLine}
                         ${logLine}
                         ${bmcLine}
+                        ${mechLine}
                     </div>`;
                     (cmap[dev.ip] || []).forEach(c => res += render(c, depth + 1, p.gmId));
                     return res;
@@ -181,7 +194,7 @@ async function fetchUI() {
         const bannerEl = document.getElementById('alertBanner');
         bannerEl.innerHTML = alerts.length === 0 ? '' :
             `<div class="alert-banner"><strong>⚠ Active Alerts (${alerts.length})</strong>` +
-            alerts.map(a => `<div class="alert-item" onclick="document.getElementById('${a.nodeId}') && document.getElementById('${a.nodeId}').scrollIntoView({behavior:'smooth',block:'center'})">${esc(a.text)}</div>`).join('') +
+            alerts.map(a => `<div class="alert-item${a.warn ? ' warn' : ''}" onclick="document.getElementById('${a.nodeId}') && document.getElementById('${a.nodeId}').scrollIntoView({behavior:'smooth',block:'center'})">${esc(a.text)}</div>`).join('') +
             `</div>`;
 
         renderLogs(d.logs);

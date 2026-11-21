@@ -1,4 +1,4 @@
-# PTPMonitor User Manual (v1.9.0)
+# PTPMonitor User Manual (v1.10.0)
 
 PTPMonitor is a specialized protocol analyzer designed to capture PTP (Precision Time Protocol) v1 / v2 traffic, visualize device status, Boundary Clock (BC) operations, and network topology for high-precision diagnostic purposes.
 
@@ -36,11 +36,25 @@ Correctly identifies true GMs by extracting `grandmasterClockUuid` from PTPv2 An
 ### 6. BMC (Best Master Clock) Information Display
 For PTPv2 Leader nodes, the BMC algorithm decision factors (`Priority1` / `ClockClass` / `Priority2`) taken from Announce packets are displayed as `BMC: P1=... / Class=... / P2=...`, which helps verify GM election priorities.
 
+### 7. Delay Mechanism Detection (E2E / P2P)
+For PTPv2 each node shows the delay mechanism it is currently using in a `Delay:` line:
+- **E2E (Delay_Req/Resp)**: seen from `Delay_Req` or `Delay_Resp` packets.
+- **P2P (peer delay)**: seen from `Pdelay_Req` / `Pdelay_Resp` / `Pdelay_Resp_Follow_Up` packets. These use their own multicast group (`224.0.0.107`), which the tool now joins in addition to the primary group (`224.0.1.129`). If joining fails, a `[WARN]` is logged and E2E monitoring continues unaffected.
+- **E2E + P2P ⚠**: both were seen from the same device, which is abnormal.
+A mechanism only counts while it was seen within the last `OfflineTimeoutSeconds`.
+
+A node that only sends peer-delay traffic is labeled `P2P node` instead of `Unknown`; the **role is never inferred from Pdelay traffic** (a P2P Leader sends Pdelay_Req too). Such a role-less node stays online while its Pdelay traffic continues, whereas a Leader/Follower is still kept alive only by role-defining packets (Sync/Announce/Delay_Req/Delay_Resp).
+
+**Mixed-mechanism warning**: if devices using E2E and devices using P2P are found together in the same PTPv2 domain for the persistence time (the same 10 s as a Conflict), the affected nodes get a yellow `DELAY MIX` badge, the alert banner lists the domain, and `[DELAY_MECH_MISMATCH]` is logged once per episode (with the number of devices on each side). This is a **warning, not a fault**: it usually indicates a profile/configuration mismatch, but a domain can legitimately contain links that differ as long as both ends of each link agree. PTPv1 (IEEE 1588-2002) has no peer-delay mechanism and is not evaluated.
+
+> [!NOTE]
+> P2P detection requires the peer-delay multicast group to reach this PC (IGMP membership on the switch port). It has been verified only against hand-built packets, not on a live network.
+
 ## WebUI Operations
 - **Uptime / Offline**: Real-time display of uptime for active devices or elapsed time since disconnection for offline devices. Uptime resets (and a `[REJOIN]` log entry is added) when a device comes back online after being offline.
 - **Search / Filter**: The search box at the top filters visible nodes by IP, MAC, or vendor as you type.
 - **Alert Banner**: A banner above the topology view lists all active Conflict/GM Mismatch alerts; clicking an entry scrolls to and highlights the corresponding node.
-- **Log Level Filters**: The Event Logs panel can be filtered to `ALL` / `ERROR` / `WARN` / `CONFLICT` / `MISMATCH` entries only.
+- **Log Level Filters**: The Event Logs panel can be filtered to `ALL` / `ERROR` / `WARN` / `CONFLICT` / `MISMATCH` (GM mismatch) / `DELAY` (E2E/P2P mixing) entries only.
 - `🗑 Clear Offline`: Batch delete all offline devices.
 - `↻ Network Clear`: Reset all data (memory and logs) and restart monitoring.
 - **Statistics Panel**: Counts and displays only currently ""online"" devices in the network.

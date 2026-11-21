@@ -45,6 +45,14 @@ class ProtocolState {
     // role information. Used to age out a stale Role instead of letting non-role traffic keep it
     // alive indefinitely (e.g. a Leader that stopped sending Sync/Announce but still emits Management).
     public long LastRoleSeenTicks { get; set; }
+    // When an E2E marker (Delay_Req / Delay_Resp) and a P2P marker (Pdelay_Req / Pdelay_Resp /
+    // Pdelay_Resp_Follow_Up) were last seen from this instance (PTPv2 only). The delay mechanism is
+    // derived from their recency at read time (see Program.DelayMech), so an instance that stops
+    // using a mechanism stops being reported as using it.
+    public long? LastE2ESeenTicks { get; set; }
+    public long? LastP2PSeenTicks { get; set; }
+    // Set by MonitorLoop while this instance's (v2, domain) has persistently mixed E2E and P2P devices.
+    public bool MechMismatch { get; set; }
 
     public bool IsConflict { get; set; }
     public long? RoleChangedAtTicks { get; set; }
@@ -135,6 +143,9 @@ class DomainGmState {
 /// </summary>
 class Program {
     static readonly string McastGroup = "224.0.1.129";
+    // IEEE 1588 Annex D: peer-delay messages (Pdelay_Req / Pdelay_Resp / Pdelay_Resp_Follow_Up) use their
+    // own link-local group, NOT the primary group above, so P2P devices are invisible without joining it.
+    static readonly string PdelayMcastGroup = "224.0.0.107";
     static readonly int[] Ports = new int[] { 319, 320 };
     static string WebPort = "8080";
     static double OfflineRetentionHours = 24.0;
@@ -167,6 +178,11 @@ class Program {
     static Dictionary<string, TopologyLink> topologyLinks = new Dictionary<string, TopologyLink>();
     // Guarded by lock(devices), like devices/topologyLinks.
     static Dictionary<string, DomainGmState> domainGms = new Dictionary<string, DomainGmState>();
+    // (v2, domain) -> when mixed E2E/P2P was first seen in it. Entries exist only while the domain is
+    // currently mixed (removed as soon as it is not), so this cannot grow beyond the active domains.
+    // mechMismatchLogged is the edge-trigger guard for [DELAY_MECH_MISMATCH]. Both guarded by lock(devices).
+    static Dictionary<string, long> mechMismatchSince = new Dictionary<string, long>();
+    static HashSet<string> mechMismatchLogged = new HashSet<string>();
     static CancellationTokenSource cts = new CancellationTokenSource();
     static StreamWriter logWriter = null;
     static string currentLogPath = "ptp_monitor.log";
@@ -211,7 +227,7 @@ class Program {
     /// </summary>
     static void Main(string[] args) {
         LoadConfig();
-        Console.WriteLine("=== PTPMonitor v1.9.0 ===");
+        Console.WriteLine("=== PTPMonitor v1.10.0 ===");
 
         NetworkInterface[] nics = NetworkInterface.GetAllNetworkInterfaces();
         List<IPAddress> validIps = new List<IPAddress>();
@@ -267,6 +283,13 @@ class Program {
                 if (sock != null) { try { sock.Close(); } catch (Exception) { /* Best-effort cleanup */ } }
                 continue;
             }
+            // The peer-delay group is optional: if joining it fails, E2E/primary-group monitoring must
+            // keep working, so this is a warning and the socket stays in use.
+            try {
+                sock.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.AddMembership, new MulticastOption(IPAddress.Parse(PdelayMcastGroup), currentLocalIp));
+            } catch (SocketException ex) {
+                Log(string.Format("[WARN] Cannot join peer-delay group {0} on UDP port {1} ({2}). P2P (peer delay) devices will not be detected.", PdelayMcastGroup, port, ex.Message));
+            }
             sockets.Add(sock);
             Task.Factory.StartNew(() => {
                 byte[] buffer = new byte[2048];
@@ -314,10 +337,11 @@ class Program {
             cts.Cancel();
             Console.WriteLine("\n[Quitting] Cleaning up and performing IGMP Leave...");
             foreach(var sock in sockets) {
-                try {
-                    sock.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.DropMembership, new MulticastOption(IPAddress.Parse(McastGroup), currentLocalIp));
-                    sock.Close();
-                } catch (Exception) { /* Best-effort cleanup during shutdown */ }
+                // Each Drop is attempted independently: the peer-delay join may have failed (or not
+                // happened), and that must not stop the primary-group Leave or the socket close.
+                try { sock.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.DropMembership, new MulticastOption(IPAddress.Parse(PdelayMcastGroup), currentLocalIp)); } catch (Exception) { /* Best-effort cleanup during shutdown */ }
+                try { sock.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.DropMembership, new MulticastOption(IPAddress.Parse(McastGroup), currentLocalIp)); } catch (Exception) { /* Best-effort cleanup during shutdown */ }
+                try { sock.Close(); } catch (Exception) { /* Best-effort cleanup during shutdown */ }
             }
             try { if (httpListener.IsListening) httpListener.Stop(); httpListener.Close(); } catch (Exception) { /* Best-effort cleanup during shutdown */ }
             lock(printLock) {
@@ -509,6 +533,18 @@ class Program {
     }
 
     /// <summary>
+    /// The delay mechanism an instance is CURRENTLY using, from marker recency: "E2E", "P2P",
+    /// "E2E+P2P" (both recently seen from one instance, itself abnormal) or "" (none recently seen).
+    /// A marker older than OfflineTimeoutSeconds no longer counts.
+    /// </summary>
+    static string DelayMech(ProtocolState p) {
+        bool e2e = p.LastE2ESeenTicks.HasValue && ElapsedSeconds(p.LastE2ESeenTicks.Value) < OfflineTimeoutSeconds;
+        bool p2p = p.LastP2PSeenTicks.HasValue && ElapsedSeconds(p.LastP2PSeenTicks.Value) < OfflineTimeoutSeconds;
+        if (e2e && p2p) return "E2E+P2P";
+        return e2e ? "E2E" : (p2p ? "P2P" : "");
+    }
+
+    /// <summary>
     /// Finds an online Leader for (version, domain) to use as a display-only "best guess" parent
     /// when no Delay_Resp-confirmed link exists yet. Never cached: recomputed on every read so a
     /// bad guess (e.g. picked while two Leaders briefly coexisted) can't outlive the situation that
@@ -538,6 +574,7 @@ class Program {
         string role = "Unknown";
         byte msgType = 0;
         byte control = 0;
+        bool seenE2E = false, seenP2P = false; // delay-mechanism markers (PTPv2 only; v1 has no P2P)
 
         if (protoVer == "v2") {
             msgType = (byte)(data[0] & 0x0F);
@@ -557,6 +594,13 @@ class Program {
             // Sync/Follow_Up have no independently-verified minimum in this file (see
             // ai-reviewer-wire-format-verification: PTP byte-level claims are not trusted without a
             // primary-source check), so they intentionally keep only the base 34-byte length check.
+            // Delay-mechanism markers. E2E: Delay_Req(1) / Delay_Resp(9, same length gate as its Leader
+            // role below). P2P: Pdelay_Req(2) / Pdelay_Resp(3) / Pdelay_Resp_Follow_Up(10); the port
+            // checks above already confirmed they arrived on the spec's port. Pdelay messages keep only
+            // the base length check (no independently verified minimum in this file); the effect of a
+            // spoofed one is limited to a persistence-gated warning, never a role.
+            if (msgType == 1 || (msgType == 9 && len >= 52)) seenE2E = true;
+            else if (msgType == 2 || msgType == 3 || msgType == 10) seenP2P = true;
             if (msgType == 0 || msgType == 8) role = "Leader"; // Sync, Follow_Up
             else if (msgType == 11 && len >= 61) role = "Leader"; // Announce
             else if (msgType == 9 && len >= 52) role = "Leader"; // Delay_Resp
@@ -640,7 +684,20 @@ class Program {
             string oldRole = pState.Role;
             // A different source clock identity behind the same IP (device swapped/re-IDed): whatever
             // GM was verified for the previous identity says nothing about this one.
-            if (pState.OwnId != null && pState.OwnId != ownId) pState.GmVerified = false;
+            if (pState.OwnId != null && pState.OwnId != ownId) {
+                pState.GmVerified = false;
+                // If the previous identity had already gone offline, the new one is a replacement device, not
+                // the old one speaking again: it must not inherit the old Role / GM / mechanism markers (a
+                // stale Leader role would otherwise also stop a role-less P2P replacement from being kept
+                // online). While the old identity is still online the change is left alone, so a single IP
+                // that fronts several clocks does not make its role flap on every alternating packet.
+                if (!pState.IsOnline) {
+                    pState.Role = "Unknown"; oldRole = "Unknown";
+                    pState.GrandmasterId = null;
+                    pState.LastE2ESeenTicks = null; pState.LastP2PSeenTicks = null;
+                    pState.RoleChangedAtTicks = null;
+                }
+            }
             pState.OwnId = ownId;
             pState.LastSeenTicks = now;
             // IsOnline is only (re)asserted alongside a role-defining packet, not on every packet:
@@ -653,6 +710,14 @@ class Program {
                 // timestamp below is refreshed, or a returning Sync-only packet would keep it alive.
                 if (ElapsedSeconds(pState.LastRoleSeenTicks) >= OfflineTimeoutSeconds) pState.GmVerified = false;
                 pState.Role = role; pState.LastRoleSeenTicks = now; pState.IsOnline = true;
+            }
+            if (seenE2E) pState.LastE2ESeenTicks = now;
+            if (seenP2P) {
+                pState.LastP2PSeenTicks = now;
+                // An instance with no role (so far only peer-delay traffic) has nothing else to prove it is
+                // alive, so Pdelay traffic is its liveness. A Leader/Follower is NOT kept alive this way
+                // (see above): its role must keep being refreshed by role-defining packets.
+                if (pState.Role == "Unknown") pState.IsOnline = true;
             }
 
             if (protoVer == "v2") {
@@ -763,7 +828,11 @@ class Program {
                         // LastSeenTicks (advanced by any packet including Management/Signaling/Pdelay),
                         // so a Leader/Follower that stopped sending Sync/Announce/Delay_Req/Delay_Resp
                         // ages out even if other non-role traffic from the same instance keeps arriving.
-                        if (pState.IsOnline && ElapsedSeconds(pState.LastRoleSeenTicks) >= OfflineTimeoutSeconds) {
+                        // A role-less instance (only peer-delay traffic seen) is judged by its latest
+                        // Pdelay packet instead, since it never sends role-defining packets.
+                        long lastLive = pState.LastRoleSeenTicks;
+                        if (pState.Role == "Unknown" && pState.LastP2PSeenTicks.HasValue && pState.LastP2PSeenTicks.Value > lastLive) lastLive = pState.LastP2PSeenTicks.Value;
+                        if (pState.IsOnline && ElapsedSeconds(lastLive) >= OfflineTimeoutSeconds) {
                             pState.IsOnline = false;
                             pState.IsConflict = false; pState.ConflictStartedAtTicks = null; pState.GmMismatchLogged = false;
                             // A stale verification must not survive an outage: if this instance comes back
@@ -824,6 +893,41 @@ class Program {
                 foreach (var obs in gmObservations) {
                     if (!domainGms.ContainsKey(StateKey(obs.Key.Version, obs.Key.Domain))) TrackDomainGm(obs.Key.Version, obs.Key.Domain, obs.Value, now);
                 }
+
+                // Delay-mechanism mixing: within one PTPv2 domain, devices using E2E (Delay_Req/Resp) and
+                // devices using P2P (Pdelay_*) together usually mean a profile/config mismatch. It is only a
+                // WARNING (a link whose two ends agree can legitimately differ from another link), and it
+                // must persist as long as a Conflict before it is reported, to ride out reconfiguration.
+                // Mechanism recency (not IsOnline) decides who counts, so a stale marker drops out by itself.
+                var mechGroups = new Dictionary<string, List<ProtocolState>>();
+                foreach (var dev in devices.Values) {
+                    foreach (var pState in dev.Protocols.Values) {
+                        pState.MechMismatch = false;
+                        if (pState.Version != "v2" || DelayMech(pState).Length == 0) continue;
+                        string mkey = StateKey(pState.Version, pState.Domain);
+                        List<ProtocolState> mlist;
+                        if (!mechGroups.TryGetValue(mkey, out mlist)) { mlist = new List<ProtocolState>(); mechGroups[mkey] = mlist; }
+                        mlist.Add(pState);
+                    }
+                }
+                var mixedKeys = new HashSet<string>();
+                foreach (var mg in mechGroups) {
+                    int e2eCount = 0, p2pCount = 0;
+                    foreach (var pState in mg.Value) {
+                        string m = DelayMech(pState);
+                        if (m.IndexOf("E2E", StringComparison.Ordinal) >= 0) e2eCount++;
+                        if (m.IndexOf("P2P", StringComparison.Ordinal) >= 0) p2pCount++;
+                    }
+                    if (e2eCount == 0 || p2pCount == 0) continue;
+                    mixedKeys.Add(mg.Key);
+                    long since;
+                    if (!mechMismatchSince.TryGetValue(mg.Key, out since)) { since = now; mechMismatchSince[mg.Key] = since; }
+                    if (ElapsedSeconds(since) >= ConflictPersistThresholdSeconds) {
+                        foreach (var pState in mg.Value) pState.MechMismatch = true;
+                        if (mechMismatchLogged.Add(mg.Key)) Log(string.Format("[DELAY_MECH_MISMATCH] Domain {0} ({1}): both E2E ({2} devices) and P2P ({3} devices) delay mechanisms observed ({4}s+).", mg.Value[0].Domain, mg.Value[0].Version, e2eCount, p2pCount, ConflictPersistThresholdSeconds.ToString("0.##", CultureInfo.InvariantCulture)));
+                    }
+                }
+                foreach (var k in mechMismatchSince.Keys.Where(k => !mixedKeys.Contains(k)).ToList()) { mechMismatchSince.Remove(k); mechMismatchLogged.Remove(k); }
 
                 // Expire confirmed topology links whose Leader is no longer valid (offline, or no
                 // longer Leader in that domain), or that haven't been reconfirmed by a fresh
@@ -1008,7 +1112,7 @@ class Program {
                 Log(string.Format("[SYSTEM] Offline devices cleared by WebUI ({0} nodes).", count));
                 res.StatusCode = 200;
             } else if (path == "/api/clear_all" && context.Request.HttpMethod == "POST") {
-                lock(devices) { devices.Clear(); topologyLinks.Clear(); domainGms.Clear(); gmHistoryLimitWarned = false; }
+                lock(devices) { devices.Clear(); topologyLinks.Clear(); domainGms.Clear(); gmHistoryLimitWarned = false; mechMismatchSince.Clear(); mechMismatchLogged.Clear(); }
                 lock(logLock) { logs.Clear(); }
                 Log("[SYSTEM] Network state and logs cleared by WebUI.");
                 res.StatusCode = 200;
@@ -1045,6 +1149,8 @@ class Program {
                             sb.Append(",\"announceLog\":").Append(pState.AnnounceLog.HasValue ? pState.AnnounceLog.Value.ToString() : "null").Append(",");
                             sb.Append("\"gmId\":").Append(JsonStr(pState.GrandmasterId ?? ""));
                             sb.Append(",\"gmVerified\":").Append(pState.GmVerified?"true":"false");
+                            sb.Append(",\"delayMech\":").Append(JsonStr(DelayMech(pState)));
+                            sb.Append(",\"mechMismatch\":").Append(pState.MechMismatch?"true":"false");
                             sb.Append(",\"vendor\":").Append(JsonStr(GetVendorSafe(dev.Mac))).Append(",");
                             sb.Append("\"gmPriority1\":").Append(pState.GmPriority1.HasValue ? pState.GmPriority1.Value.ToString() : "null").Append(",");
                             sb.Append("\"gmClass\":").Append(pState.GmClass.HasValue ? pState.GmClass.Value.ToString() : "null").Append(",");

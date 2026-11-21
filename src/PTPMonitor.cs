@@ -35,6 +35,15 @@ class ProtocolState {
     public int? GmPriority1 { get; set; }
     public int? GmPriority2 { get; set; }
     public int? GmClass { get; set; }
+    // Remaining Announce fields (PTPv2). Values are as of the last Announce; null = not (yet) read.
+    // GmAccuracy/GmVariance describe the GM's clockQuality; StepsRemoved/TimeSource sit at the end of the
+    // 64-byte Announce and are only read when the packet is long enough to contain them.
+    public int? GmAccuracy { get; set; }
+    public int? GmVariance { get; set; }        // offsetScaledLogVariance (unsigned 16-bit)
+    public int? StepsRemoved { get; set; }      // unsigned 16-bit
+    public int? TimeSource { get; set; }
+    public int? UtcOffset { get; set; }         // currentUtcOffset, SIGNED 16-bit seconds
+    public int? TimeFlags { get; set; }         // flagField[1]: bit0 leap61, 1 leap59, 2 utcValid, 3 ptpTimescale, 4 timeTraceable, 5 freqTraceable
 
     // Freshness/online status for THIS instance specifically, so a stale Leader on one
     // domain/version can't linger just because another instance of the same device is alive.
@@ -227,7 +236,7 @@ class Program {
     /// </summary>
     static void Main(string[] args) {
         LoadConfig();
-        Console.WriteLine("=== PTPMonitor v1.10.0 ===");
+        Console.WriteLine("=== PTPMonitor v1.11.0 ===");
 
         NetworkInterface[] nics = NetworkInterface.GetAllNetworkInterfaces();
         List<IPAddress> validIps = new List<IPAddress>();
@@ -533,6 +542,17 @@ class Program {
     }
 
     /// <summary>
+    /// The timestamp that decides whether an instance is still alive: its last role-defining packet, or,
+    /// for a role-less instance (only peer-delay traffic so far), its latest Pdelay packet, since such an
+    /// instance never sends role-defining packets. A Leader/Follower is NOT kept alive by Pdelay traffic.
+    /// </summary>
+    static long LastLiveTicks(ProtocolState p) {
+        long last = p.LastRoleSeenTicks;
+        if (p.Role == "Unknown" && p.LastP2PSeenTicks.HasValue && p.LastP2PSeenTicks.Value > last) last = p.LastP2PSeenTicks.Value;
+        return last;
+    }
+
+    /// <summary>
     /// The delay mechanism an instance is CURRENTLY using, from marker recency: "E2E", "P2P",
     /// "E2E+P2P" (both recently seen from one instance, itself abnormal) or "" (none recently seen).
     /// A marker older than OfflineTimeoutSeconds no longer counts.
@@ -691,10 +711,17 @@ class Program {
                 // stale Leader role would otherwise also stop a role-less P2P replacement from being kept
                 // online). While the old identity is still online the change is left alone, so a single IP
                 // that fronts several clocks does not make its role flap on every alternating packet.
-                if (!pState.IsOnline) {
+                // "Already offline" is judged by elapsed time too, not just the IsOnline flag: that flag is
+                // only cleared by the once-per-second MonitorLoop sweep, so right after the timeout a
+                // replacement packet can arrive before the sweep has run and would inherit the old values.
+                if (!pState.IsOnline || ElapsedSeconds(LastLiveTicks(pState)) >= OfflineTimeoutSeconds) {
                     pState.Role = "Unknown"; oldRole = "Unknown";
                     pState.GrandmasterId = null;
                     pState.LastE2ESeenTicks = null; pState.LastP2PSeenTicks = null;
+                    // Everything learned from the previous identity's Announces is void for the new one.
+                    pState.GmPriority1 = null; pState.GmPriority2 = null; pState.GmClass = null;
+                    pState.GmAccuracy = null; pState.GmVariance = null; pState.StepsRemoved = null;
+                    pState.TimeSource = null; pState.UtcOffset = null; pState.TimeFlags = null;
                     pState.RoleChangedAtTicks = null;
                 }
             }
@@ -772,6 +799,18 @@ class Program {
             // GM Info from Announce (v2)
             if (protoVer == "v2" && msgType == 11 && len >= 61) {
                 pState.GmPriority1 = data[47]; pState.GmClass = data[48]; pState.GmPriority2 = data[52];
+                // Announce body layout (IEEE 1588-2008; checked against linuxptp msg.h and Wireshark
+                // packet-ptp.c): currentUtcOffset 44-45 (signed, big-endian), clockAccuracy 49,
+                // offsetScaledLogVariance 50-51, stepsRemoved 61-62, timeSource 63 (64 bytes total, no
+                // TLV). The time-property flags are in the common header, flagField[1] = byte 7.
+                // Bytes up to 60 are covered by the len >= 61 gate above; stepsRemoved/timeSource each
+                // need their own length so a short packet never yields a misread value.
+                pState.GmAccuracy = data[49];
+                pState.GmVariance = (data[50] << 8) | data[51];
+                pState.UtcOffset = unchecked((short)((data[44] << 8) | data[45]));
+                pState.TimeFlags = data[7];
+                pState.StepsRemoved = len >= 63 ? (int?)((data[61] << 8) | data[62]) : null;
+                pState.TimeSource = len >= 64 ? (int?)data[63] : null;
                 string gmId = BitConverter.ToString(data, 53, 8).Replace("-","");
                 if (pState.GmVerified && pState.GrandmasterId != gmId) {
                     Log(string.Format("[GM_CHANGE] {0} v2 GM {1} -> {2}", ip, pState.GrandmasterId, gmId));
@@ -830,9 +869,7 @@ class Program {
                         // ages out even if other non-role traffic from the same instance keeps arriving.
                         // A role-less instance (only peer-delay traffic seen) is judged by its latest
                         // Pdelay packet instead, since it never sends role-defining packets.
-                        long lastLive = pState.LastRoleSeenTicks;
-                        if (pState.Role == "Unknown" && pState.LastP2PSeenTicks.HasValue && pState.LastP2PSeenTicks.Value > lastLive) lastLive = pState.LastP2PSeenTicks.Value;
-                        if (pState.IsOnline && ElapsedSeconds(lastLive) >= OfflineTimeoutSeconds) {
+                        if (pState.IsOnline && ElapsedSeconds(LastLiveTicks(pState)) >= OfflineTimeoutSeconds) {
                             pState.IsOnline = false;
                             pState.IsConflict = false; pState.ConflictStartedAtTicks = null; pState.GmMismatchLogged = false;
                             // A stale verification must not survive an outage: if this instance comes back
@@ -1059,6 +1096,22 @@ class Program {
     /// <summary>
     /// Formats a double as a JSON number, independent of the OS locale (decimal point is always '.').
     /// </summary>
+    static string JsonInt(int? v) {
+        return v.HasValue ? v.Value.ToString(CultureInfo.InvariantCulture) : "null";
+    }
+
+    /// <summary>
+    /// Decodes the Announce time-property flag byte (flagField[1]) as a JSON object, or null when no
+    /// Announce has been read. Bit meanings: 0 leap61, 1 leap59, 2 currentUtcOffsetValid,
+    /// 3 ptpTimescale, 4 timeTraceable, 5 frequencyTraceable.
+    /// </summary>
+    static string JsonTimeProps(int? flags) {
+        if (!flags.HasValue) return "null";
+        int f = flags.Value;
+        Func<int, string> b = bit => (f & (1 << bit)) != 0 ? "true" : "false";
+        return "{\"leap61\":" + b(0) + ",\"leap59\":" + b(1) + ",\"utcValid\":" + b(2) + ",\"ptpTimescale\":" + b(3) + ",\"timeTraceable\":" + b(4) + ",\"freqTraceable\":" + b(5) + "}";
+    }
+
     static string JsonNum(double d) {
         if (double.IsNaN(d) || double.IsInfinity(d)) return "null";
         return d.ToString("R", CultureInfo.InvariantCulture);
@@ -1149,6 +1202,12 @@ class Program {
                             sb.Append(",\"announceLog\":").Append(pState.AnnounceLog.HasValue ? pState.AnnounceLog.Value.ToString() : "null").Append(",");
                             sb.Append("\"gmId\":").Append(JsonStr(pState.GrandmasterId ?? ""));
                             sb.Append(",\"gmVerified\":").Append(pState.GmVerified?"true":"false");
+                            sb.Append(",\"gmAccuracy\":").Append(JsonInt(pState.GmAccuracy));
+                            sb.Append(",\"gmVariance\":").Append(JsonInt(pState.GmVariance));
+                            sb.Append(",\"stepsRemoved\":").Append(JsonInt(pState.StepsRemoved));
+                            sb.Append(",\"timeSource\":").Append(JsonInt(pState.TimeSource));
+                            sb.Append(",\"utcOffset\":").Append(JsonInt(pState.UtcOffset));
+                            sb.Append(",\"timeProps\":").Append(JsonTimeProps(pState.TimeFlags));
                             sb.Append(",\"delayMech\":").Append(JsonStr(DelayMech(pState)));
                             sb.Append(",\"mechMismatch\":").Append(pState.MechMismatch?"true":"false");
                             sb.Append(",\"vendor\":").Append(JsonStr(GetVendorSafe(dev.Mac))).Append(",");

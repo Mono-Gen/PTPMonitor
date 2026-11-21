@@ -1,4 +1,4 @@
-# PTPMonitor 使用説明書 (v1.10.0)
+# PTPMonitor 使用説明書 (v1.11.0)
 
 PTPMonitor は、ネットワーク上の PTP (Precision Time Protocol) v1 / v2 通信をキャプチャし、デバイスの稼働状況や Boundary Clock (BC) の動作、トポロジーを可視化・診断する「運用特化型プロトコルアナライザー」です。
 
@@ -49,6 +49,17 @@ Pdelay 通信しか行わないノードは `Unknown` ではなく `P2P node` �
 
 > [!NOTE]
 > P2P の検出には、ピア遅延用マルチキャストグループがこの PC まで届く必要があります（スイッチポートの IGMP 参加など）。現時点では手作りパケットでの検証のみで、実ネットワークでの動作は未確認です。
+
+### 8. Announce のクロック品質と時刻プロパティ
+Announce を送信した PTPv2 の Leader ノードには、`BMC:` 行の下にさらに2行を表示します。
+- `Clock: Accuracy ... / Variance 0x.... / Source ... / Steps removed N` — `clockAccuracy`、`offsetScaledLogVariance`、`timeSource`、`stepsRemoved`（その Announce が Grandmaster から何ホップ先か）です。
+- `Time: UTC offset ... s (valid | NOT valid) / PTP timescale | ARB timescale / time-traceable ✓✗ / freq-traceable ✓✗ [/ leap61] [/ leap59]` — `currentUtcOffset`（符号付き秒）と、Announce の時刻プロパティのフラグです。
+
+補足:
+- 生の値は常に表示します。Accuracy と time source の名称は、Wireshark の PTP dissector の表で確認できた値にのみ付け、それ以外は `0xNN (unrecognized)` と表示します。**`clockClass` は数値のみ**（`BMC:` 行に表示）で、意味はプロファイルに依存するためここでは解釈しません。
+- `✗` は「未設定」を表すだけで、障害ではありません。たとえば PTP 以外の timescale は、プロファイルによっては正常です。
+- 値は、そのノードから**最後に受信した Announce** のものです。受信するまでは `N/A` で、`stepsRemoved` は 63 バイト以上、`timeSource` は 64 バイトの完全な Announce が必要です。行にマウスを重ねると内容の説明が表示されます。
+- 表示のみで、これらの値からアラートは出しません。「なぜこの GM が選ばれたか」の順位表示も行いません。Best Master Clock アルゴリズムの比較順がプロファイル（既定・ITU-T G.8275 など）で異なるためです。
 
 ## WebUI の操作
 - **Uptime / Offline**: 各デバイスの直近の稼働時間、または切断後の経過時間をリアルタイム表示します。オフラインから復帰するとUptimeがリセットされ、`[REJOIN]` ログが記録されます。

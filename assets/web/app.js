@@ -6,6 +6,46 @@ function simpleHash(s) { let h = 0; for (let i = 0; i < s.length; i++) h = (h * 
 // hash suffix disambiguates them so an alert's click-to-scroll always lands on the right node.
 function nodeElId(ip, ver, dom) { const raw = ip + '|' + ver + '|' + dom; return 'node_' + raw.replace(/[^a-zA-Z0-9_]/g, '_') + '_' + simpleHash(raw); }
 
+// Labels for Announce enumerations. ONLY values confirmed against Wireshark's PTP dissector tables
+// (ptp_v2_clockAccuracy_vals / ptp_v2_timeSource_vals) are named; anything else is shown as its raw
+// value marked "unrecognized" rather than guessed. clockClass has no table there, so it stays numeric.
+const ACCURACY_LABELS = {
+    0x17:'1 ps',0x18:'2.5 ps',0x19:'10 ps',0x1A:'25 ps',0x1B:'100 ps',0x1C:'250 ps',
+    0x1D:'1 ns',0x1E:'2.5 ns',0x1F:'10 ns',0x20:'25 ns',0x21:'100 ns',0x22:'250 ns',
+    0x23:'1 µs',0x24:'2.5 µs',0x25:'10 µs',0x26:'25 µs',0x27:'100 µs',0x28:'250 µs',
+    0x29:'1 ms',0x2A:'2.5 ms',0x2B:'10 ms',0x2C:'25 ms',0x2D:'100 ms',0x2E:'250 ms',
+    0x2F:'1 s',0x30:'10 s'
+};
+const TIMESOURCE_LABELS = { 0x10:'Atomic clock',0x20:'GPS',0x30:'Terrestrial radio',0x39:'Serial time code',0x40:'PTP',0x50:'NTP',0x60:'Hand set',0x90:'Other',0xA0:'Internal oscillator' };
+function hex2(v) { return '0x' + v.toString(16).toUpperCase().padStart(2, '0'); }
+function accuracyText(v) {
+    if (v === null || v === undefined) return 'N/A';
+    if (ACCURACY_LABELS[v]) return `≤ ${ACCURACY_LABELS[v]} (${hex2(v)})`;
+    if (v === 0x31) return `> 10 s (${hex2(v)})`;
+    if (v === 0x80) return `alternate profile (${hex2(v)})`;
+    if (v === 0xFE) return `unknown (${hex2(v)})`;
+    return `${hex2(v)} (unrecognized)`;
+}
+function timeSourceText(v) {
+    if (v === null || v === undefined) return 'N/A';
+    return TIMESOURCE_LABELS[v] ? `${TIMESOURCE_LABELS[v]} (${hex2(v)})` : `${hex2(v)} (unrecognized)`;
+}
+// The flags are shown positively: a ✗ is "not set", which is not by itself an error.
+// A missing field (null, or undefined if the API omits it) must render as N/A and never throw: an
+// exception here would abort the whole poll's rendering.
+function numText(v) { return (v === null || v === undefined) ? 'N/A' : String(v); }
+function varianceText(v) { return Number.isInteger(v) ? '0x' + v.toString(16).toUpperCase().padStart(4, '0') : 'N/A'; }
+function timePropsText(tp, utcOffset) {
+    const off = Number.isInteger(utcOffset) ? `${utcOffset > 0 ? '+' : ''}${utcOffset} s` : 'N/A';
+    const parts = [`UTC offset ${off} (${tp.utcValid ? 'valid' : 'NOT valid'})`,
+        tp.ptpTimescale ? 'PTP timescale' : 'ARB timescale',
+        `time-traceable ${tp.timeTraceable ? '✓' : '✗'}`,
+        `freq-traceable ${tp.freqTraceable ? '✓' : '✗'}`];
+    if (tp.leap61) parts.push('leap61');
+    if (tp.leap59) parts.push('leap59');
+    return parts.join(' / ');
+}
+
 let logFilterLevel = 'ALL';
 let lastLogs = [];
 const LOG_TAG_MAP = { ERROR: '[ERROR]', WARN: '[WARN]', CONFLICT: '[CONFLICT_ALERT]', MISMATCH: '[GM_MISMATCH]', DELAY: '[DELAY_MECH_MISMATCH]' };
@@ -140,6 +180,12 @@ async function fetchUI() {
                     let logLine = (role === 'leader' && v === 'v2') ? `<div class="info-row" style="opacity:0.7">Sync: ${valS(p.syncLog)} / Announce: ${valS(p.announceLog)}</div>` : '';
                     let bmcLine = (role === 'leader' && v === 'v2' && p.gmPriority1 !== null) ? `<div class="info-row" style="opacity:0.7">BMC: P1=${valS(p.gmPriority1)} / Class=${valS(p.gmClass)} / P2=${valS(p.gmPriority2)}</div>` : '';
 
+                    // Remaining Announce fields (v2 Leaders that have sent an Announce). Raw numbers are always
+                    // shown; ClockClass has no verified meaning table, so it is not labelled.
+                    const hasAnnounce = (role === 'leader' && v === 'v2' && p.timeProps);
+                    const qualLine = hasAnnounce ? `<div class="info-row" style="opacity:0.7" title="clockAccuracy / offsetScaledLogVariance / timeSource / stepsRemoved from the last Announce">Clock: Accuracy ${esc(accuracyText(p.gmAccuracy))} / Variance ${esc(varianceText(p.gmVariance))} / Source ${esc(timeSourceText(p.timeSource))} / Steps removed ${esc(numText(p.stepsRemoved))}</div>` : '';
+                    const timeLine = hasAnnounce ? `<div class="info-row" style="opacity:0.7" title="currentUtcOffset and the Announce time-property flags">Time: ${esc(timePropsText(p.timeProps, p.utcOffset))}</div>` : '';
+
                     // Delay mechanism (E2E / P2P) is only reported for v2. An instance with no role that only
                     // does peer-delay is a P2P node, not "Unknown".
                     const mechLabels = { 'E2E': 'E2E (Delay_Req/Resp)', 'P2P': 'P2P (peer delay)', 'E2E+P2P': 'E2E + P2P ⚠' };
@@ -176,6 +222,8 @@ async function fetchUI() {
                         ${gmLine}
                         ${logLine}
                         ${bmcLine}
+                        ${qualLine}
+                        ${timeLine}
                         ${mechLine}
                     </div>`;
                     (cmap[dev.ip] || []).forEach(c => res += render(c, depth + 1, p.gmId));

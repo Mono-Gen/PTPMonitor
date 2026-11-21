@@ -207,7 +207,33 @@ class Program {
     static HashSet<string> intervalMismatchLogged = new HashSet<string>();
     static CancellationTokenSource cts = new CancellationTokenSource();
     static StreamWriter logWriter = null;
-    static string currentLogPath = "ptp_monitor.log";
+    const string AppVersion = "1.16.0";
+    // The folder the program runs from (ends with a directory separator). Logs live here, and config.ini is looked
+    // up here when the working directory has none: a Windows service or a scheduled task starts with the SYSTEM
+    // directory as its working directory, not the program's own folder.
+    static readonly string BaseDir = AppDomain.CurrentDomain.BaseDirectory;
+    static string currentLogPath = Path.Combine(BaseDir, "ptp_monitor.log");
+    // Settings that can also be given on the command line (the command line wins): see LoadConfig.
+    static string configNic = null, configPort = null, configBind = null;
+    // Optional extra web listener address (--bind / WebBind). While set, the dashboard is READ-ONLY: it has no
+    // authentication, so nothing that changes state is served at all.
+    static IPAddress webBindIp = null;
+    static bool webReadOnly = false;
+    static string webStartError = null;
+    // For /metrics: datagrams handed to the parser, and those it accepted as well-formed PTP.
+    // Each counter is incremented once, AFTER the parser has finished with a datagram, so neither ever decreases.
+    static long packetsRejected = 0, packetsAccepted = 0;
+    [ThreadStatic] static bool packetAccepted;   // set by ParsePacket at the point a datagram passes every well-formedness check
+    static readonly long startedTicks = Stopwatch.GetTimestamp();   // monotonic: a system clock change must not move uptime
+
+    /// <summary>Runs the parser on one datagram and counts it as accepted or rejected for /metrics.</summary>
+    static void ParseCounted(string src, byte[] buffer, int length, int port) {
+        packetAccepted = false;
+        try { ParsePacket(src, buffer, length, port); }
+        finally {
+            if (packetAccepted) Interlocked.Increment(ref packetsAccepted); else Interlocked.Increment(ref packetsRejected);
+        }
+    }
     static object printLock = new object();
     static List<string> logs = new List<string>();
     static object logLock = new object();
@@ -261,62 +287,104 @@ class Program {
     /// Entry point. Handles interface selection and starts monitoring tasks.
     /// </summary>
     static int Main(string[] args) {
-        string pcapPath = null, portArg = null;
-        bool summaryOnly = false;
+        string pcapPath = null, portArg = null, nicArg = null, bindArg = null;
+        bool summaryOnly = false, noPrompt = false;
         for (int i = 0; i < args.Length; i++) {
             string a = args[i];
             // An option that takes a value must be followed by one: another "--option" is not a value.
             bool hasValue = i + 1 < args.Length && !args[i + 1].StartsWith("--", StringComparison.Ordinal);
             if (a == "--pcap" && hasValue) pcapPath = args[++i];
             else if (a == "--port" && hasValue) portArg = args[++i];
+            else if (a == "--nic" && hasValue) nicArg = args[++i];
+            else if (a == "--bind" && hasValue) bindArg = args[++i];
+            else if (a == "--no-prompt") noPrompt = true;
             else if (a == "--summary") summaryOnly = true;
+            else if (a == "--version") { Console.WriteLine("PTPMonitor " + AppVersion); return 0; }
             else if (a == "--help" || a == "-h" || a == "/?") { PrintUsage(); return 0; }
             else { Console.Error.WriteLine("Unknown or incomplete argument: " + a); PrintUsage(); return 2; }
         }
         if (summaryOnly && pcapPath == null) { Console.Error.WriteLine("--summary requires --pcap <file>"); PrintUsage(); return 2; }
-        if (pcapPath != null) return RunOfflineMode(pcapPath, summaryOnly, portArg);
+        if (pcapPath != null && nicArg != null) { Console.Error.WriteLine("--nic cannot be used with --pcap (an analysis opens no network interface)."); return 2; }
+        if (pcapPath != null) return RunOfflineMode(pcapPath, summaryOnly, portArg, bindArg, noPrompt);
 
         LoadConfig();
-        Console.WriteLine("=== PTPMonitor v1.14.0 ===");
+        Console.WriteLine("=== PTPMonitor v" + AppVersion + " ===");
+        int bindRc = ApplyBind(bindArg);
+        if (bindRc != 0) return bindRc;
+        int portRc = ApplyPortSetting(portArg);
+        if (portRc != 0) return portRc;
 
+        // Interface lists (the same text as before, plus parallel lists for the non-interactive choice).
         NetworkInterface[] nics = NetworkInterface.GetAllNetworkInterfaces();
         List<IPAddress> validIps = new List<IPAddress>();
-
-        Console.WriteLine("\n[Available IPv4 Interfaces]");
-        int index = 1;
+        var ipText = new List<string>(); var descs = new List<string>();
         foreach (var nic in nics) {
             if (nic.OperationalStatus == OperationalStatus.Up && nic.NetworkInterfaceType != NetworkInterfaceType.Loopback) {
                 foreach (var ip in nic.GetIPProperties().UnicastAddresses) {
                     if (ip.Address.AddressFamily == AddressFamily.InterNetwork) {
-                        Console.WriteLine(string.Format("  {0}: {1} - {2}", index, ip.Address, nic.Description));
-                        validIps.Add(ip.Address);
-                        index++;
+                        validIps.Add(ip.Address); ipText.Add(ip.Address.ToString()); descs.Add(nic.Description);
+                    }
+                }
+            }
+        }
+        if (validIps.Count == 0) { Console.Error.WriteLine("Error: No valid IPv4 interfaces found."); return 1; }
+
+        // No prompting at all when the interface is given (--nic / Nic in config.ini) or --no-prompt is set:
+        // a service or scheduled task has nobody to answer, and must fail loudly instead of guessing.
+        string nicSpec = nicArg ?? configNic;
+        bool nonInteractive = noPrompt || nicSpec != null;
+        if (nonInteractive) {
+            if (nicSpec == null) {
+                Console.Error.WriteLine("[ERROR] --no-prompt needs the interface: give --nic <IP|number|text> (or Nic in config.ini).");
+                PrintNicList(ipText, descs, Console.Error); return 2;
+            }
+            int chosen; string nicError;
+            if (!ResolveNic(nicSpec, ipText, descs, out chosen, out nicError)) {
+                Console.Error.WriteLine("[ERROR] " + nicError); PrintNicList(ipText, descs, Console.Error); return 2;
+            }
+            currentLocalIp = validIps[chosen];
+            Console.WriteLine(string.Format("Using NIC {0} - {1}", ipText[chosen], descs[chosen]));
+        } else {
+            Console.WriteLine("\n[Available IPv4 Interfaces]");
+            PrintNicList(ipText, descs, Console.Out);
+            Console.Write(string.Format("\nSelect NIC Number (1-{0}) [Default: 1]: ", validIps.Count));
+            string input = Console.ReadLine();
+            // No console input at all (EOF): there is nobody to ask, so do not silently pick interface 1.
+            if (input == null) {
+                Console.Error.WriteLine("[ERROR] No console input is available to choose an interface; use --nic <IP|number|text> (or Nic in config.ini).");
+                return 2;
+            }
+            int selIndex = 1;
+            if (!string.IsNullOrEmpty(input)) int.TryParse(input, out selIndex);
+            if (selIndex < 1 || selIndex > validIps.Count) selIndex = 1;
+            currentLocalIp = validIps[selIndex-1];
+
+            if (!webPortGiven) {
+                Console.Write("Enter Web UI Port [Default: 8080]: ");
+                string pIn = Console.ReadLine();
+                if (!string.IsNullOrEmpty(pIn)) {
+                    int parsedPort;
+                    if (int.TryParse(pIn, NumberStyles.None, CultureInfo.InvariantCulture, out parsedPort) && parsedPort >= 1 && parsedPort <= 65535) {
+                        WebPort = parsedPort.ToString(CultureInfo.InvariantCulture);
+                    } else {
+                        Console.WriteLine(string.Format("[WARN] Invalid port '{0}', keeping default {1}.", pIn, WebPort));
                     }
                 }
             }
         }
 
-        if (validIps.Count == 0) { Console.WriteLine("Error: No valid IPv4 interfaces found."); return 1; }
-        Console.Write(string.Format("\nSelect NIC Number (1-{0}) [Default: 1]: ", validIps.Count));
-        string input = Console.ReadLine();
-        int selIndex = 1;
-        if (!string.IsNullOrEmpty(input)) int.TryParse(input, out selIndex);
-        if (selIndex < 1 || selIndex > validIps.Count) selIndex = 1;
-        currentLocalIp = validIps[selIndex-1];
-
-        Console.Write("Enter Web UI Port [Default: 8080]: ");
-        string pIn = Console.ReadLine();
-        if (!string.IsNullOrEmpty(pIn)) {
-            int parsedPort;
-            if (int.TryParse(pIn, NumberStyles.None, CultureInfo.InvariantCulture, out parsedPort) && parsedPort >= 1 && parsedPort <= 65535) {
-                WebPort = parsedPort.ToString(CultureInfo.InvariantCulture);
-            } else {
-                Console.WriteLine(string.Format("[WARN] Invalid port '{0}', keeping default {1}.", pIn, WebPort));
-            }
-        }
-
         RotateLogFile();
         Task.Factory.StartNew(WebServerLoop, cts.Token, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+        // Unattended (or with an explicit --bind) a dashboard that cannot start must stop the program with an error
+        // instead of leaving it running unseen; interactive use keeps monitoring and just logs the error, as before.
+        if (nonInteractive || webBindIp != null) {
+            for (int w = 0; w < 60 && !httpListener.IsListening && webStartError == null; w++) Thread.Sleep(50);
+            if (!httpListener.IsListening) {
+                Console.Error.WriteLine("[ERROR] The web dashboard could not be started on port " + WebPort + ": " + (webStartError ?? "timed out") + " (is the port already in use" + (webBindIp != null ? ", or does listening on " + webBindIp + " need extra permission (a URL ACL; not verified here)" : "") + "?).");
+                cts.Cancel();
+                return 1;
+            }
+        }
         Task.Factory.StartNew(MonitorLoop, cts.Token, TaskCreationOptions.LongRunning, TaskScheduler.Default);
 
         var sockets = new List<Socket>();
@@ -348,7 +416,7 @@ class Program {
                     try {
                         EndPoint ep = new IPEndPoint(IPAddress.Any, 0);
                         int received = sock.ReceiveFrom(buffer, ref ep);
-                        if (received > 0) ParsePacket(((IPEndPoint)ep).Address.ToString(), buffer, received, port);
+                        if (received > 0) ParseCounted(((IPEndPoint)ep).Address.ToString(), buffer, received, port);
                         consecutiveErrors = 0;
                     } catch (SocketException ex) {
                         // Blocking receive is aborted by sock.Close() on shutdown. ConnectionReset (ICMP
@@ -384,19 +452,7 @@ class Program {
 
         Console.CancelKeyPress += (s, e) => {
             e.Cancel = true;
-            cts.Cancel();
-            Console.WriteLine("\n[Quitting] Cleaning up and performing IGMP Leave...");
-            foreach(var sock in sockets) {
-                // Each Drop is attempted independently: the peer-delay join may have failed (or not
-                // happened), and that must not stop the primary-group Leave or the socket close.
-                try { sock.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.DropMembership, new MulticastOption(IPAddress.Parse(PdelayMcastGroup), currentLocalIp)); } catch (Exception) { /* Best-effort cleanup during shutdown */ }
-                try { sock.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.DropMembership, new MulticastOption(IPAddress.Parse(McastGroup), currentLocalIp)); } catch (Exception) { /* Best-effort cleanup during shutdown */ }
-                try { sock.Close(); } catch (Exception) { /* Best-effort cleanup during shutdown */ }
-            }
-            try { if (httpListener.IsListening) httpListener.Stop(); httpListener.Close(); } catch (Exception) { /* Best-effort cleanup during shutdown */ }
-            lock(printLock) {
-                if(logWriter != null) { logWriter.Close(); logWriter = null; }
-            }
+            Shutdown(sockets);
             Environment.Exit(0);
         };
 
@@ -405,11 +461,141 @@ class Program {
     }
 
     /// <summary>
+    /// Orderly stop: cancel the loops, leave the multicast groups, close the sockets and the web listener, close the
+    /// log file. One place for every way the program can be told to stop.
+    /// </summary>
+    static void Shutdown(List<Socket> sockets) {
+        cts.Cancel();
+        Console.WriteLine("\n[Quitting] Cleaning up and performing IGMP Leave...");
+        foreach(var sock in sockets) {
+            // Each Drop is attempted independently: the peer-delay join may have failed (or not
+            // happened), and that must not stop the primary-group Leave or the socket close.
+            try { sock.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.DropMembership, new MulticastOption(IPAddress.Parse(PdelayMcastGroup), currentLocalIp)); } catch (Exception) { /* Best-effort cleanup during shutdown */ }
+            try { sock.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.DropMembership, new MulticastOption(IPAddress.Parse(McastGroup), currentLocalIp)); } catch (Exception) { /* Best-effort cleanup during shutdown */ }
+            try { sock.Close(); } catch (Exception) { /* Best-effort cleanup during shutdown */ }
+        }
+        try { if (httpListener.IsListening) httpListener.Stop(); httpListener.Close(); } catch (Exception) { /* Best-effort cleanup during shutdown */ }
+        lock(printLock) {
+            if(logWriter != null) { logWriter.Close(); logWriter = null; }
+        }
+    }
+
+    // ===================== Start-up options (non-interactive operation) =====================
+
+    static bool webPortGiven = false;   // the port came from --port or config.ini, so there is nothing to ask
+
+    static bool TryParsePort(string s, out int port) {
+        return int.TryParse(s, NumberStyles.None, CultureInfo.InvariantCulture, out port) && port >= 1 && port <= 65535;
+    }
+
+    /// <summary>Applies --port, else the WebPort setting of config.ini. A bad value is an error (exit code 2), not a silent default.</summary>
+    static int ApplyPortSetting(string portArg) {
+        string spec = portArg ?? configPort;
+        if (spec == null) return 0;
+        int p;
+        if (!TryParsePort(spec, out p)) {
+            Console.Error.WriteLine("[ERROR] Invalid web port '" + spec + "' (" + (portArg != null ? "--port" : "WebPort in config.ini") + "): use 1-65535.");
+            return 2;
+        }
+        WebPort = p.ToString(CultureInfo.InvariantCulture);
+        webPortGiven = true;
+        return 0;
+    }
+
+    /// <summary>
+    /// Applies --bind, else WebBind of config.ini: one extra address the dashboard also listens on. Only a literal
+    /// address is accepted: wildcards (0.0.0.0, ::, *, +) and host names are refused, since Microsoft advises against
+    /// top-level wildcard bindings for HttpListener and a name could resolve to anything. Reachable from other machines,
+    /// the dashboard has no authentication, so it becomes read-only (webReadOnly).
+    /// </summary>
+    static int ApplyBind(string bindArg) {
+        string spec = bindArg ?? configBind;
+        if (spec == null) return 0;
+        IPAddress ip;
+        if (!IPAddress.TryParse(spec.Trim(), out ip)) {
+            Console.Error.WriteLine("[ERROR] Invalid " + (bindArg != null ? "--bind" : "WebBind") + " value '" + spec + "': give one IP address (no host names or wildcards).");
+            return 2;
+        }
+        if (ip.Equals(IPAddress.Any) || ip.Equals(IPAddress.IPv6Any) || ip.Equals(IPAddress.None)) {
+            Console.Error.WriteLine("[ERROR] Wildcard addresses are not accepted for --bind: give the one address to listen on.");
+            return 2;
+        }
+        // Only this machine's own unicast addresses (or loopback): a foreign or multicast address could never be bound anyway.
+        bool isLocal = IPAddress.IsLoopback(ip);
+        if (!isLocal) {
+            try {
+                foreach (var nic in NetworkInterface.GetAllNetworkInterfaces())
+                    foreach (var ua in nic.GetIPProperties().UnicastAddresses)
+                        if (ua.Address.Equals(ip)) { isLocal = true; break; }
+            } catch (Exception) { /* cannot enumerate: treated as not local below */ }
+        }
+        if (!isLocal) {
+            Console.Error.WriteLine("[ERROR] " + (bindArg != null ? "--bind" : "WebBind") + " address " + ip + " is not an address of this machine (loopback or an interface's unicast address is required).");
+            return 2;
+        }
+        webBindIp = ip;
+        webReadOnly = true;
+        Console.WriteLine("[INFO] The dashboard also listens on " + ip + " and is READ-ONLY (no authentication: use it only on a trusted network).");
+        return 0;
+    }
+
+    static string HostForUrl(IPAddress ip) {
+        return ip.AddressFamily == AddressFamily.InterNetworkV6 ? "[" + ip + "]" : ip.ToString();
+    }
+
+    static void PrintNicList(IList<string> ips, IList<string> descs, TextWriter w) {
+        w.WriteLine("[Available IPv4 Interfaces]");
+        for (int i = 0; i < ips.Count; i++) w.WriteLine(string.Format("  {0}: {1} - {2}", i + 1, ips[i], descs[i]));
+    }
+
+    /// <summary>
+    /// Chooses the interface from a --nic / Nic value: an exact IP address, the number shown in the list (1-based),
+    /// or text that matches exactly ONE adapter description (case-insensitive). Anything ambiguous or absent is an
+    /// error: guessing could monitor the wrong network.
+    /// </summary>
+    static bool ResolveNic(string spec, IList<string> ips, IList<string> descs, out int index, out string error) {
+        index = -1; error = null;
+        spec = (spec ?? "").Trim();
+        if (spec.Length == 0) { error = "Empty --nic value."; return false; }
+        IPAddress parsed;
+        // Only a full dotted quad is an address ("1.2.3" would otherwise be read by .NET as 1.2.0.3).
+        if (spec.Split('.').Length == 4 && IPAddress.TryParse(spec, out parsed)) {
+            string text = parsed.ToString();
+            for (int i = 0; i < ips.Count; i++) if (ips[i] == text) { index = i; return true; }
+            error = "No listed interface has the address " + spec + ".";
+            return false;
+        }
+        int n;
+        if (int.TryParse(spec, NumberStyles.None, CultureInfo.InvariantCulture, out n)) {
+            if (n >= 1 && n <= ips.Count) { index = n - 1; return true; }
+            error = string.Format("Interface number {0} is out of range (1-{1}).", n, ips.Count);
+            return false;
+        }
+        var hits = new List<int>();
+        for (int i = 0; i < descs.Count; i++) if (descs[i].IndexOf(spec, StringComparison.OrdinalIgnoreCase) >= 0) hits.Add(i);
+        if (hits.Count == 1) { index = hits[0]; return true; }
+        error = hits.Count == 0 ? "No interface description contains '" + spec + "'."
+                                : string.Format("'{0}' matches {1} interfaces; use the IP address or the number instead.", spec, hits.Count);
+        return false;
+    }
+
+    /// <summary>
+    /// config.ini is looked up in the working directory first (as always), then next to the program; when neither exists a
+    /// default is created next to the program. The program folder matters for a service or scheduled task, whose working
+    /// directory is the SYSTEM directory.
+    /// </summary>
+    static string ResolveConfigPath() {
+        string cwdCfg = Path.GetFullPath("config.ini");
+        if (File.Exists(cwdCfg)) return cwdCfg;
+        return Path.Combine(BaseDir, "config.ini");
+    }
+
+    /// <summary>
     /// Loads settings (retention, thresholds, OUI maps, etc.) from config.ini.
     /// </summary>
     static void LoadConfig() {
         try {
-            string path = "config.ini";
+            string path = ResolveConfigPath();
             if (!File.Exists(path)) {
                 string[] defaults = {
                     "[Settings]",
@@ -439,6 +625,12 @@ class Program {
                             ApplyConfigDouble(key, val, ref OfflineTimeoutSeconds, 0.001, double.MaxValue);
                         } else if (key.Equals("AnnounceReceiptTimeout", StringComparison.OrdinalIgnoreCase)) {
                             ApplyConfigDouble(key, val, ref AnnounceReceiptTimeout, 2.0, 255.0);
+                        } else if (key.Equals("Nic", StringComparison.OrdinalIgnoreCase)) {
+                            configNic = val.Length > 0 ? val : null;      // validated when used (an error aborts start-up)
+                        } else if (key.Equals("WebPort", StringComparison.OrdinalIgnoreCase)) {
+                            configPort = val.Length > 0 ? val : null;
+                        } else if (key.Equals("WebBind", StringComparison.OrdinalIgnoreCase)) {
+                            configBind = val.Length > 0 ? val : null;
                         } else {
                             customVendors[key.ToUpper()] = val;
                         }
@@ -471,7 +663,7 @@ class Program {
             var oldWriter = logWriter;
             logWriter = null;
             if (oldWriter != null) oldWriter.Close();
-            string logDir = "logs";
+            string logDir = Path.Combine(BaseDir, "logs");
             if (!Directory.Exists(logDir)) Directory.CreateDirectory(logDir);
             string old = currentLogPath;
             string rotated = Path.Combine(logDir, string.Format("ptp_monitor_{0}.log", DateTime.Now.ToString("yyyyMMdd_HHmmss")));
@@ -699,6 +891,7 @@ class Program {
             else if (control == 1) role = "Follower"; // Delay_Req
         }
 
+        packetAccepted = true;   // passed every well-formedness check above: ParseCounted counts it for /metrics
         long now = NowTicks();
         string stateKey = StateKey(protoVer, domain);
 
@@ -1150,6 +1343,10 @@ class Program {
         try {
             httpListener.Prefixes.Add("http://localhost:" + WebPort + "/");
             httpListener.Prefixes.Add("http://127.0.0.1:" + WebPort + "/");
+            if (webBindIp != null) {
+                string bindPrefix = "http://" + HostForUrl(webBindIp) + ":" + WebPort + "/";
+                if (!httpListener.Prefixes.Contains(bindPrefix)) httpListener.Prefixes.Add(bindPrefix);   // --bind 127.0.0.1 repeats a default prefix
+            }
             httpListener.Start();
             // Bound idle/slow connections so a stalled client cannot pin a thread-pool thread forever.
             var timeout = TimeSpan.FromSeconds(30);
@@ -1157,6 +1354,7 @@ class Program {
             httpListener.TimeoutManager.HeaderWait = timeout;
             httpListener.TimeoutManager.EntityBody = timeout;
         } catch (Exception ex) {
+            webStartError = ex.Message;   // read by Main, which stops an unattended run that has no dashboard
             Log(string.Format("[ERROR] Web server failed to start on port {0}: {1} (Is the port already in use?)", WebPort, ex.Message));
             return;
         }
@@ -1268,6 +1466,12 @@ class Program {
         try {
             string path = context.Request.Url.AbsolutePath;
             bool isMutatingApi = context.Request.HttpMethod == "POST" && (path == "/api/clear_offline" || path == "/api/clear_all");
+            // With --bind the dashboard is reachable from other machines and has no authentication: it serves
+            // nothing that changes state, whoever asks (a local request included, so there is no ambiguity).
+            if (isMutatingApi && webReadOnly) {
+                res.StatusCode = 403;
+                return;
+            }
             if (isMutatingApi && !IsSameOriginRequest(context.Request)) {
                 res.StatusCode = 403;
                 return;
@@ -1278,7 +1482,7 @@ class Program {
                 return;
             }
 
-            if (path.StartsWith("/api/", StringComparison.Ordinal)) res.Headers.Add("Cache-Control", "no-store");
+            if (path.StartsWith("/api/", StringComparison.Ordinal) || path == "/metrics") res.Headers.Add("Cache-Control", "no-store");
 
             if (path == "/api/clear_offline" && context.Request.HttpMethod == "POST") {
                 int count = 0;
@@ -1297,11 +1501,14 @@ class Program {
                 lock(logLock) { logs.Clear(); }
                 Log("[SYSTEM] Network state and logs cleared by WebUI.");
                 res.StatusCode = 200;
+            } else if (path == "/metrics" && context.Request.HttpMethod == "GET") {
+                ServeMetrics(context);
             } else if (path == "/api/data") {
                 var sb = new StringBuilder();
                 sb.Append("{\"expectedDelayInterval\":").Append(JsonNum(ExpectedDelayInterval));
                 sb.Append(",\"delayAlertThresholdRate\":").Append(JsonNum(DelayAlertThresholdRate)).Append(",");
                 sb.Append("\"analysis\":").Append(AnalysisJson()).Append(",");
+                sb.Append("\"readOnly\":").Append(webReadOnly ? "true" : "false").Append(",");
                 lock(devices) {
                     sb.Append("\"devices\":["); bool f = true;
                     foreach(var dev in devices.Values) {
@@ -1417,16 +1624,101 @@ class Program {
         }
     }
 
+    // ===================== /metrics (Prometheus text exposition format 0.0.4) =====================
+
+    // Escaping per the format: label values escape \ " and line feed; HELP text escapes \ and line feed.
+    static string PromLabel(string v) { return (v ?? "").Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\n", "\\n"); }
+    static string PromHelp(string v) { return v.Replace("\\", "\\\\").Replace("\n", "\\n"); }
+
+    /// <summary>
+    /// GET /metrics: the current state as Prometheus metrics. Only LOW-cardinality labels are used (versions, states, and the
+    /// one settled Grandmaster per domain, whose count is bounded by the domain table's own limit), never one series per
+    /// device. Each metric is one group (HELP, TYPE, then its samples), the payload ends with a line feed, and the
+    /// Content-Type is text/plain; version=0.0.4.
+    /// </summary>
+    static void ServeMetrics(HttpListenerContext context) {
+        var sb = new StringBuilder();
+        Action<string, string, string> meta = (name, type, help) => {
+            sb.Append("# HELP ").Append(name).Append(' ').Append(PromHelp(help)).Append('\n');
+            sb.Append("# TYPE ").Append(name).Append(' ').Append(type).Append('\n');
+        };
+        Action<string, string, string> sample = (name, labels, value) => {
+            sb.Append(name);
+            if (labels.Length > 0) sb.Append('{').Append(labels).Append('}');
+            sb.Append(' ').Append(value).Append('\n');
+        };
+        Func<long, string> num = n => n.ToString(CultureInfo.InvariantCulture);
+
+        long online = 0, offline = 0, leadersV1 = 0, leadersV2 = 0, gmMismatches = 0, announceTimeouts = 0, mechDomains = 0, intervalDomains = 0;
+        var conflictDomains = new HashSet<string>();
+        var gmInfo = new List<string>();
+        lock (devices) {
+            foreach (var dev in devices.Values) {
+                if (dev.IsOnline) online++; else offline++;
+                foreach (var ps in dev.Protocols.Values) {
+                    if (ps.IsOnline && ps.Role == "Leader") { if (ps.Version == "v1") leadersV1++; else leadersV2++; }
+                    if (ps.IsConflict) conflictDomains.Add(StateKey(ps.Version, ps.Domain));
+                    if (ps.GmMismatchLogged) gmMismatches++;
+                    if (ps.AnnounceStale) announceTimeouts++;
+                }
+            }
+            mechDomains = mechMismatchLogged.Count;
+            intervalDomains = intervalMismatchLogged.Count;
+            foreach (var kv in domainGms.OrderBy(k => k.Key, StringComparer.Ordinal)) {
+                if (kv.Value.Gm == null) continue;
+                string[] parts = kv.Key.Split(new string[] { KeySep }, 2, StringSplitOptions.None);
+                gmInfo.Add(string.Format("version=\"{0}\",domain=\"{1}\",gm=\"{2}\"", PromLabel(parts[0]), PromLabel(parts.Length > 1 ? parts[1] : ""), PromLabel(kv.Value.Gm)));
+            }
+        }
+        long rejected = Interlocked.Read(ref packetsRejected), accepted = Interlocked.Read(ref packetsAccepted);
+
+        meta("ptpmonitor_build_info", "gauge", "PTPMonitor version (always 1).");
+        sample("ptpmonitor_build_info", "version=\"" + PromLabel(AppVersion) + "\"", "1");
+        meta("ptpmonitor_uptime_seconds", "gauge", "Seconds since the program started.");
+        sample("ptpmonitor_uptime_seconds", "", ((Stopwatch.GetTimestamp() - startedTicks) / (double)Stopwatch.Frequency).ToString("0.###", CultureInfo.InvariantCulture));
+        meta("ptpmonitor_devices", "gauge", "Devices currently in the list, by state.");
+        sample("ptpmonitor_devices", "state=\"online\"", num(online));
+        sample("ptpmonitor_devices", "state=\"offline\"", num(offline));
+        meta("ptpmonitor_leader_instances", "gauge", "Online Leader instances, by PTP version.");
+        sample("ptpmonitor_leader_instances", "version=\"v1\"", num(leadersV1));
+        sample("ptpmonitor_leader_instances", "version=\"v2\"", num(leadersV2));
+        meta("ptpmonitor_conflicts_active", "gauge", "Domains currently in a persistent conflict (several distinct Grandmasters).");
+        sample("ptpmonitor_conflicts_active", "", num(conflictDomains.Count));
+        meta("ptpmonitor_gm_mismatches_active", "gauge", "Followers whose Grandmaster differs from their confirmed parent's.");
+        sample("ptpmonitor_gm_mismatches_active", "", num(gmMismatches));
+        meta("ptpmonitor_announce_timeouts_active", "gauge", "Leaders still active but no longer sending Announce.");
+        sample("ptpmonitor_announce_timeouts_active", "", num(announceTimeouts));
+        meta("ptpmonitor_delay_mechanism_mixes_active", "gauge", "Domains where E2E and P2P delay mechanisms are mixed.");
+        sample("ptpmonitor_delay_mechanism_mixes_active", "", num(mechDomains));
+        meta("ptpmonitor_announce_interval_mismatches_active", "gauge", "Domains whose Leaders announce at different intervals.");
+        sample("ptpmonitor_announce_interval_mismatches_active", "", num(intervalDomains));
+        meta("ptpmonitor_domain_grandmaster_info", "gauge", "The last Grandmaster the online Leaders of a domain agreed on (always 1); kept while the domain is in conflict or has no Leader.");
+        foreach (var labels in gmInfo) sample("ptpmonitor_domain_grandmaster_info", labels, "1");
+        meta("ptpmonitor_packets_total", "counter", "PTP datagrams handed to the parser, by result.");
+        sample("ptpmonitor_packets_total", "result=\"accepted\"", num(accepted));
+        sample("ptpmonitor_packets_total", "result=\"rejected\"", num(rejected));
+
+        byte[] body = Encoding.UTF8.GetBytes(sb.ToString());
+        context.Response.ContentType = "text/plain; version=0.0.4; charset=utf-8";
+        context.Response.ContentLength64 = body.Length;
+        context.Response.OutputStream.Write(body, 0, body.Length);
+    }
+
     // ===================== Offline (pcap / pcapng) analysis =====================
 
     static ReplayStats analysis = null;               // non-null only in offline mode
 
     static void PrintUsage() {
         Console.WriteLine("Usage:");
-        Console.WriteLine("  PTPMonitor.exe                          Live monitoring (choose a NIC)");
-        Console.WriteLine("  PTPMonitor.exe --pcap <file> [--port N]  Analyze a pcap/pcapng capture and show the dashboard");
-        Console.WriteLine("  PTPMonitor.exe --pcap <file> --summary   Print events and a device table, then exit (no dashboard)");
-        Console.WriteLine("Exit codes: 0 ok, 1 capture could not be read, 2 bad arguments.");
+        Console.WriteLine("  PTPMonitor.exe                                   Live monitoring (asks for the interface and web port)");
+        Console.WriteLine("  PTPMonitor.exe --nic <IP|number|text> [--port N] Live monitoring without any prompt (for services / scheduled tasks)");
+        Console.WriteLine("  PTPMonitor.exe --no-prompt                       Never prompt; the interface must come from --nic or config.ini (Nic)");
+        Console.WriteLine("  PTPMonitor.exe ... --bind <IP>                   Also serve the dashboard on this address, READ-ONLY (no authentication)");
+        Console.WriteLine("  PTPMonitor.exe --pcap <file> [--port N]          Analyze a pcap/pcapng capture and show the dashboard");
+        Console.WriteLine("  PTPMonitor.exe --pcap <file> --summary           Print events and a device table, then exit (no dashboard)");
+        Console.WriteLine("  PTPMonitor.exe --version | --help");
+        Console.WriteLine("config.ini keys Nic, WebPort and WebBind give the same settings; the command line wins.");
+        Console.WriteLine("Exit codes: 0 ok, 1 runtime failure (capture unreadable, no port could be opened, dashboard could not start), 2 bad arguments or settings.");
     }
 
     /// <summary>
@@ -1434,24 +1726,24 @@ class Program {
     /// virtual clock taken from the capture's timestamps, then either print a summary or serve the (frozen)
     /// result on the dashboard. No sockets are opened and no log file is written.
     /// </summary>
-    static int RunOfflineMode(string pcapPath, bool summaryOnly, string portArg) {
+    static int RunOfflineMode(string pcapPath, bool summaryOnly, string portArg, string bindArg, bool noPrompt) {
         LoadConfig();
-        Console.WriteLine("=== PTPMonitor v1.14.0 (offline analysis) ===");
-        if (!File.Exists(pcapPath)) { Console.Error.WriteLine("[ERROR] File not found: " + pcapPath); return 1; }
-        if (portArg != null) {
-            int p;
-            if (!(int.TryParse(portArg, NumberStyles.None, CultureInfo.InvariantCulture, out p) && p >= 1 && p <= 65535)) {
-                Console.Error.WriteLine("[ERROR] Invalid --port value: " + portArg); return 2;
-            }
-            WebPort = p.ToString(CultureInfo.InvariantCulture);
+        Console.WriteLine("=== PTPMonitor v" + AppVersion + " (offline analysis) ===");
+        // Bad settings (exit 2) are reported before a missing file (exit 1).
+        int portRc = ApplyPortSetting(portArg);
+        if (portRc != 0) return portRc;
+        if (!summaryOnly) {   // a text summary has no dashboard to bind
+            int bindRc = ApplyBind(bindArg);
+            if (bindRc != 0) return bindRc;
         }
+        if (!File.Exists(pcapPath)) { Console.Error.WriteLine("[ERROR] File not found: " + pcapPath); return 1; }
         consoleLog = summaryOnly;   // summary mode prints each event as it happens; dashboard mode keeps them in memory
         if (summaryOnly) Console.WriteLine("\n=== Events (capture time) ===");
         int rc = RunReplay(pcapPath);
         if (rc != 0) return rc;
         if (summaryOnly) { PrintSummary(); return 0; }
 
-        if (portArg == null) {
+        if (!webPortGiven && !noPrompt) {
             Console.Write("Enter Web UI Port [Default: 8080]: ");
             string pIn = Console.ReadLine();
             if (!string.IsNullOrEmpty(pIn)) {
@@ -1465,9 +1757,11 @@ class Program {
         Task.Factory.StartNew(WebServerLoop, cts.Token, TaskCreationOptions.LongRunning, TaskScheduler.Default);
         // The dashboard is the whole point of this mode: if it cannot start (e.g. the port is taken) say so and exit,
         // instead of waiting forever behind an unreachable page.
-        for (int i = 0; i < 60 && !httpListener.IsListening; i++) Thread.Sleep(50);
+        for (int i = 0; i < 60 && !httpListener.IsListening && webStartError == null; i++) Thread.Sleep(50);
         if (!httpListener.IsListening) {
-            Console.Error.WriteLine(string.Format("[ERROR] The dashboard could not be started on port {0} (is the port already in use?). Use --port to choose another, or --summary for text output.", WebPort));
+            Console.Error.WriteLine(string.Format("[ERROR] The dashboard could not be started on port {0}: {1} (is the port already in use{2}?). Use --port to choose another, or --summary for text output.",
+                WebPort, webStartError ?? "timed out",
+                webBindIp != null ? ", or does listening on " + webBindIp + " need extra permission (a URL ACL; not verified here)" : ""));
             return 1;
         }
         Console.WriteLine("[INFO] Web Server -> http://localhost:{0}/\n", WebPort);
@@ -1564,7 +1858,7 @@ class Program {
                 string src, skip; byte[] payload; int port;
                 if (!PcapReader.TryExtractUdp(rec.Data, rec.LinkType, out src, out payload, out port, out skip)) { analysis.Skip(skip); continue; }
                 analysis.Fed++;
-                try { ParsePacket(src, payload, payload.Length, port); }
+                try { ParseCounted(src, payload, payload.Length, port); }
                 catch (Exception ex) { analysis.Skip("parser error (" + ex.GetType().Name + ")"); }
             }
         } catch (CaptureFormatException ex) {

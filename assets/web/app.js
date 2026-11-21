@@ -251,7 +251,7 @@ async function fetchUI() {
 
                     const nodeOnline = dev.online && p.online;
                     const searchBlob = esc((dev.ip + ' ' + dev.mac + ' ' + (p.vendor || '')).toLowerCase());
-                    let res = `<div id="${nodeId}" class="node ${role} ${isConflict} ${isMismatch?'conflict':''} ${nodeOnline?'':'offline'} ${linkUnconfirmed?'unconfirmed-link':''} ${(p.mechMismatch || p.announceStale || p.intervalMismatch) ? 'mech-warn' : ''}" style="margin-left:${indent}px" data-search="${searchBlob}">
+                    let res = `<div id="${nodeId}" data-ver="${esc(p.version)}" data-dom="${esc(p.domain)}" class="node ${role} ${isConflict} ${isMismatch?'conflict':''} ${nodeOnline?'':'offline'} ${linkUnconfirmed?'unconfirmed-link':''} ${(p.mechMismatch || p.announceStale || p.intervalMismatch) ? 'mech-warn' : ''}" style="margin-left:${indent}px" data-search="${searchBlob}">
                         <div style="display:flex;justify-content:space-between">
                             <div class="mac" style="color:${color}">${arrow}${esc(dev.ip)}</div>
                             <span>
@@ -300,8 +300,100 @@ async function fetchUI() {
 
 // Periodic polling lives ONLY here; button handlers call fetchUI() directly for a
 // one-shot refresh so clicking cannot spawn additional polling loops.
+// ---- Timeline: the structured event history from /api/events ----
+// Event types by filter group. START/END pairs let you see how long a problem lasted.
+const TL_GROUPS = {
+    ALERT: ['CONFLICT_START', 'CONFLICT_END', 'GM_MISMATCH_START', 'GM_MISMATCH_END'],
+    ROLE: ['ROLE_CHANGE', 'GM_CHANGE'],
+    PRESENCE: ['JOIN', 'REJOIN', 'OFFLINE', 'LEAVE', 'SYSTEM'],
+    TIMING: ['DELAY_MIX_START', 'DELAY_MIX_END', 'ANNOUNCE_TIMEOUT_START', 'ANNOUNCE_TIMEOUT_END', 'INTERVAL_MISMATCH_START', 'INTERVAL_MISMATCH_END']
+};
+// Severity is shown with an icon AND a word, never by colour alone.
+const TL_SEV = { alert: { icon: '⛔', label: 'ALERT' }, warn: { icon: '⚠', label: 'WARN' }, info: { icon: 'ℹ', label: 'INFO' } };
+const TL_MAX_CLIENT = 20000;
+let tlEvents = [], tlLastSeq = 0, tlEpoch = null, tlSession = null, tlGroup = 'ALL', tlShown = 200, tlDropped = 0, tlCapacity = 0, tlGap = false, tlNotLoaded = 0;
+
+function setTlGroup(g) {
+    tlGroup = g; tlShown = 200;
+    document.querySelectorAll('#tlFilters button').forEach(b => b.classList.toggle('active', b.dataset.group === g));
+    renderTimeline();
+}
+function tlShowMore() { tlShown += 200; renderTimeline(); }
+function tlMatches(e, term) {
+    if (tlGroup !== 'ALL' && TL_GROUPS[tlGroup].indexOf(e.type) === -1) return false;
+    if (!term) return true;
+    return (e.ip + ' ' + e.domain + ' ' + e.type + ' ' + e.message).toLowerCase().indexOf(term) !== -1;
+}
+function renderTimeline() {
+    const el = document.getElementById('tl'); if (!el) return;
+    const term = (document.getElementById('tlSearch').value || '').trim().toLowerCase();
+    const rows = []; let matched = 0;
+    for (let i = tlEvents.length - 1; i >= 0; i--) {                 // newest first
+        const e = tlEvents[i];
+        if (!tlMatches(e, term)) continue;
+        matched++;
+        if (rows.length < tlShown) {
+            const ended = /_END$/.test(e.type);
+            const sev = ended ? { icon: '✔', label: 'RESOLVED' } : (TL_SEV[e.severity] || TL_SEV.info);
+            rows.push(`<div class="tl-row sev-${ended ? 'ok' : esc(e.severity)}" data-ip="${esc(e.ip)}" data-ver="${esc(e.version)}" data-dom="${esc(e.domain)}" onclick="tlJump(this)" title="Click to jump to the node">` +
+                `<span class="tl-time">${esc(e.time.replace('T', ' ').slice(0, 19))}</span>` +
+                `<span class="tl-sev">${sev.icon} ${sev.label}</span><span class="tl-type">${esc(e.type)}</span>` +
+                `<span class="tl-msg">${esc(e.message)}</span></div>`);
+        }
+    }
+    el.innerHTML = rows.length ? rows.join('') : '<div class="info-row" style="padding:0.5rem">No events yet</div>';
+    const more = document.getElementById('tlMore');
+    more.style.display = matched > rows.length ? '' : 'none';
+    more.innerText = `Show more (${matched - rows.length} older)`;
+    const notes = [];
+    if (tlDropped > 0) notes.push(`${tlDropped} older event(s) were discarded: the history keeps the latest ${tlCapacity}.`);
+    if (tlGap) notes.push('Some events were discarded before they could be shown.');
+    if (tlNotLoaded > 0) notes.push(`Showing the newest ${tlEvents.length} events; ${tlNotLoaded} older ones are kept by the server — use ⬇ JSON / CSV to get them all.`);
+    document.getElementById('tlNote').innerText = notes.join(' ');
+}
+// Click a row: scroll to the node it is about. Device-level events carry an IP; domain-level ones only a
+// version + domain, so the first node of that domain is used.
+function tlJump(row) {
+    const ip = row.dataset.ip, ver = row.dataset.ver, dom = row.dataset.dom;
+    let target = null;
+    if (ip && ver) target = document.getElementById(nodeElId(ip, ver, dom));
+    if (!target && ip) target = document.querySelector('[id^="node_' + ip.replace(/[^a-zA-Z0-9_]/g, '_') + '_"]');
+    if (!target && ver && dom) target = [...document.querySelectorAll('.node')].find(n => n.dataset.ver === ver && n.dataset.dom === dom);
+    if (target) target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+}
+async function fetchTimeline(isRetry) {
+    try {
+        // First load: take as much of the retained history as the page keeps (not just the newest few), so the
+        // client's cursor never jumps past events it did not receive. Later polls ask only for newer events.
+        const initial = tlLastSeq === 0;
+        const r = await fetch('/api/events?since=' + tlLastSeq + '&limit=' + (initial ? TL_MAX_CLIENT : 2000));
+        if (!r.ok) return;
+        const d = await r.json();
+        // The server restarted (a new session) or its sequence went backwards: our cursor refers to a history that
+        // no longer exists. Start over instead of polling "newer than 5000" from a server that is at 10 forever.
+        if ((tlSession !== null && d.session !== tlSession) || d.lastSeq < tlLastSeq) {
+            tlEvents = []; tlLastSeq = 0; tlGap = false; tlNotLoaded = 0; tlEpoch = null; tlSession = d.session;
+            if (!isRetry) return fetchTimeline(true);
+        }
+        tlSession = d.session;
+        // "Network Clear" changes the epoch: drop what we hold. New events always have higher sequence numbers
+        // than anything seen before, so this response already contains exactly the post-clear events.
+        if (tlEpoch !== null && d.epoch !== tlEpoch) { tlEvents = []; tlGap = false; tlNotLoaded = 0; }
+        tlEpoch = d.epoch;
+        if (initial) tlNotLoaded = Math.max(0, d.total - d.events.length);   // retained on the server but not loaded here
+        // The store keeps a bounded window: if its oldest event is newer than what we asked for, some were lost.
+        if (tlLastSeq > 0 && d.firstSeq > 0 && tlLastSeq + 1 < d.firstSeq) tlGap = true;
+        d.events.forEach(e => tlEvents.push(e));
+        if (tlEvents.length > TL_MAX_CLIENT) tlEvents = tlEvents.slice(tlEvents.length - TL_MAX_CLIENT);
+        if (d.events.length) tlLastSeq = d.events[d.events.length - 1].seq;
+        tlDropped = d.dropped; tlCapacity = d.capacity;
+        renderTimeline();
+    } catch (e) { console.error(e); }
+}
+
 async function pollLoop() {
     await fetchUI();
+    await fetchTimeline();
     setTimeout(pollLoop, 2000);
 }
 

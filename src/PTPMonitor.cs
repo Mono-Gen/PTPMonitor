@@ -67,6 +67,7 @@ class ProtocolState {
     public long? LastAnnounceTicks { get; set; }
     public bool AnnounceStale { get; set; }          // set by MonitorLoop: no Announce for AnnounceReceiptTimeout intervals
     public bool AnnounceStaleLogged { get; set; }    // edge-trigger guard for [ANNOUNCE_TIMEOUT]
+    public long? AnnounceStaleSinceTicks { get; set; }   // when the timeout episode was reported (for the END event's duration)
     public bool IntervalMismatch { get; set; }       // set by MonitorLoop: this domain's Leaders use different Announce intervals
 
     public bool IsConflict { get; set; }
@@ -74,6 +75,7 @@ class ProtocolState {
     public long? ConflictStartedAtTicks { get; set; }
     // Edge-trigger guard so [GM_MISMATCH] is logged once per mismatch episode, not on every packet.
     public bool GmMismatchLogged { get; set; }
+    public long? GmMismatchSinceTicks { get; set; }  // when the mismatch episode was reported (for the END event's duration)
 
     public ProtocolState(string version, string domain) {
         Version = version;
@@ -152,6 +154,90 @@ class DomainGmState {
     public DomainGmState() { Events = new List<GmChangeEvent>(); }
 }
 
+/// <summary>One structured event (something that started, changed or ended), as shown in the dashboard's timeline.</summary>
+class EventRecord {
+    public long Seq;
+    public DateTime Time;     // WallNow(): real time live, capture time when analyzing a pcap
+    public string Type;       // e.g. JOIN, OFFLINE, CONFLICT_START, CONFLICT_END ...
+    public string Severity;   // info | warn | alert
+    public string Ip;         // "" for domain-level events
+    public string Version;    // "v1" / "v2", or "" for device-level events
+    public string Domain;
+    public string Message;    // the same readable text as the matching log line (without its [TAG])
+}
+
+/// <summary>What one /api/events query returns.</summary>
+class EventPage {
+    public string Session;     // random per store instance (i.e. per program start): a change means the server restarted
+    public int Epoch;          // bumped by "Network Clear": the client must discard what it holds
+    public long FirstSeq;      // oldest sequence number still retained (0 when empty)
+    public long LastSeq;       // newest sequence number issued so far
+    public int Total;          // events retained (unfiltered)
+    public long Dropped;       // events discarded because the store was full
+    public int Capacity;
+    public List<EventRecord> Events = new List<EventRecord>();
+}
+
+/// <summary>
+/// Fixed-capacity ring of events. When it is full the OLDEST event is overwritten and counted in Dropped, so
+/// memory is bounded no matter how many events a (possibly spoofed) network produces, and nothing is lost
+/// silently. All access is serialized by its own leaf lock (it never calls out while holding it).
+/// </summary>
+class EventStore {
+    readonly object sync = new object();
+    readonly EventRecord[] buf;
+    int start, count, epoch = 1;
+    long nextSeq = 1, dropped;
+    readonly string session = Guid.NewGuid().ToString("N").Substring(0, 12);
+
+    public EventStore(int capacity) { buf = new EventRecord[capacity]; }
+    public int Capacity { get { return buf.Length; } }
+
+    public void Add(EventRecord e) {
+        lock (sync) {
+            e.Seq = nextSeq++;
+            if (count == buf.Length) { buf[start] = e; start = (start + 1) % buf.Length; dropped++; }
+            else { buf[(start + count) % buf.Length] = e; count++; }
+        }
+    }
+
+    /// <summary>Empties the store. Sequence numbers keep increasing; the epoch changes so clients can tell.</summary>
+    public void Clear() {
+        lock (sync) { Array.Clear(buf, 0, buf.Length); start = 0; count = 0; dropped = 0; epoch++; }
+    }
+
+    /// <summary>
+    /// sinceSeq == 0: the newest `limit` matching events (initial load / export), oldest first.
+    /// sinceSeq  > 0: up to `limit` matching events with Seq > sinceSeq, oldest first (incremental polling).
+    /// types/ip/domain filter when non-null/non-empty.
+    /// </summary>
+    public EventPage Query(long sinceSeq, ICollection<string> types, string ip, string domain, int limit) {
+        var page = new EventPage();
+        lock (sync) {
+            page.Session = session; page.Epoch = epoch; page.Total = count; page.Dropped = dropped; page.Capacity = buf.Length;
+            page.LastSeq = nextSeq - 1;
+            page.FirstSeq = count == 0 ? 0 : buf[start].Seq;
+            Func<EventRecord, bool> match = e =>
+                (types == null || types.Count == 0 || types.Contains(e.Type)) &&
+                (string.IsNullOrEmpty(ip) || e.Ip == ip) &&
+                (string.IsNullOrEmpty(domain) || e.Domain == domain);
+            if (sinceSeq <= 0) {
+                for (int i = count - 1; i >= 0 && page.Events.Count < limit; i--) {
+                    var e = buf[(start + i) % buf.Length];
+                    if (match(e)) page.Events.Add(e);
+                }
+                page.Events.Reverse();
+            } else {
+                for (int i = 0; i < count && page.Events.Count < limit; i++) {
+                    var e = buf[(start + i) % buf.Length];
+                    if (e.Seq > sinceSeq && match(e)) page.Events.Add(e);
+                }
+            }
+        }
+        return page;
+    }
+}
+
 /// <summary>
 /// Main program class for PTPMonitor.
 /// Controls packet capture, monitoring loops, and the web server.
@@ -201,10 +287,10 @@ class Program {
     // currently mixed (removed as soon as it is not), so this cannot grow beyond the active domains.
     // mechMismatchLogged is the edge-trigger guard for [DELAY_MECH_MISMATCH]. Both guarded by lock(devices).
     static Dictionary<string, long> mechMismatchSince = new Dictionary<string, long>();
-    static HashSet<string> mechMismatchLogged = new HashSet<string>();
+    static Dictionary<string, long> mechMismatchLogged = new Dictionary<string, long>();   // key -> when the START was reported
     // Same pattern for differing Announce intervals within a (v2, domain). Guarded by lock(devices).
     static Dictionary<string, long> intervalMismatchSince = new Dictionary<string, long>();
-    static HashSet<string> intervalMismatchLogged = new HashSet<string>();
+    static Dictionary<string, long> intervalMismatchLogged = new Dictionary<string, long>();   // key -> when the START was reported
     static CancellationTokenSource cts = new CancellationTokenSource();
     static StreamWriter logWriter = null;
     static string currentLogPath = "ptp_monitor.log";
@@ -216,6 +302,54 @@ class Program {
     static Dictionary<string, string> customVendors = new Dictionary<string, string>();
     static IPAddress currentLocalIp = IPAddress.Any;
     static HttpListener httpListener = new HttpListener();
+    // Structured event history (see EventStore). Bounded; the offline analysis replaces it with a larger one.
+    const int LiveEventCapacity = 5000, OfflineEventCapacity = 50000;
+    // Largest page one request may ask for: enough to export a whole offline-analysis history (50,000) in one go.
+    const int MaxEventsPerRequest = 100000;
+    static EventStore events = new EventStore(LiveEventCapacity);
+    // (version,domain) -> when a Conflict episode was reported. Present only while the domain is in conflict, so
+    // it is bounded by the number of active domains; used to emit exactly one START and one END per episode.
+    static Dictionary<string, long> conflictEpisodes = new Dictionary<string, long>();   // guarded by lock(devices)
+
+    static void Emit(string type, string severity, string ip, string version, string domain, string message) {
+        events.Add(new EventRecord { Time = WallNow(), Type = type, Severity = severity, Ip = ip ?? "", Version = version ?? "", Domain = domain ?? "", Message = message });
+    }
+
+    /// <summary>Writes the usual "[TAG] message" log line (unchanged) AND records the same message as an event.</summary>
+    static void LogEvent(string tag, string type, string severity, string ip, string version, string domain, string message) {
+        Log("[" + tag + "] " + message);
+        Emit(type, severity, ip, version, domain, message);
+    }
+
+    static string SplitKeyPart(string key, int index) {
+        string[] p = key.Split(new string[] { KeySep }, 2, StringSplitOptions.None);
+        return index < p.Length ? p[index] : "";
+    }
+
+    /// <summary>Ends a domain-level episode (mixed delay mechanism, differing Announce intervals) in the history.</summary>
+    static void EmitDomainEnd(string type, string key, string what, long sinceTicks) {
+        string ver = SplitKeyPart(key, 0), dom = SplitKeyPart(key, 1);
+        Emit(type, "info", "", ver, dom, string.Format("Domain {0} ({1}): {2} after {3}s.", dom, ver, what, (int)ElapsedSeconds(sinceTicks)));
+    }
+
+    /// <summary>Ends a GM-mismatch episode for one Follower instance (no-op if none was reported).</summary>
+    static void EndGmMismatch(ProtocolState ps, string ip, string why) {
+        if (ps.GmMismatchLogged) {
+            Emit("GM_MISMATCH_END", "info", ip, ps.Version, ps.Domain,
+                string.Format("{0} ({1}) GM mismatch over ({2}) after {3}s.", ip, ps.Version, why, ps.GmMismatchSinceTicks.HasValue ? (int)ElapsedSeconds(ps.GmMismatchSinceTicks.Value) : 0));
+        }
+        ps.GmMismatchLogged = false; ps.GmMismatchSinceTicks = null;
+    }
+
+    /// <summary>Ends an Announce-timeout episode for one Leader instance (no-op if none was reported).</summary>
+    static void EndAnnounceStale(ProtocolState ps, string ip, string why) {
+        if (ps.AnnounceStaleLogged) {
+            Emit("ANNOUNCE_TIMEOUT_END", "info", ip, ps.Version, ps.Domain,
+                string.Format("{0} ({1}, domain {2}) Announce timeout over ({3}) after {4}s.", ip, ps.Version, ps.Domain, why, ps.AnnounceStaleSinceTicks.HasValue ? (int)ElapsedSeconds(ps.AnnounceStaleSinceTicks.Value) : 0));
+        }
+        ps.AnnounceStale = false; ps.AnnounceStaleLogged = false; ps.AnnounceStaleSinceTicks = null;
+    }
+
     // Live mode echoes every log line to the console; the offline dashboard mode turns that off (the
     // lines are still kept in the in-memory log shown on the dashboard).
     static bool consoleLog = true;
@@ -277,7 +411,7 @@ class Program {
         if (pcapPath != null) return RunOfflineMode(pcapPath, summaryOnly, portArg);
 
         LoadConfig();
-        Console.WriteLine("=== PTPMonitor v1.14.0 ===");
+        Console.WriteLine("=== PTPMonitor v1.15.0 ===");
 
         NetworkInterface[] nics = NetworkInterface.GetAllNetworkInterfaces();
         List<IPAddress> validIps = new List<IPAddress>();
@@ -540,8 +674,37 @@ class Program {
     /// Must be called while holding lock(devices).
     /// </summary>
     static void RemoveDeviceLinks(string ip) {
-        var toRemove = topologyLinks.Where(kv => kv.Value.LeaderIp == ip || kv.Value.FollowerIp == ip).Select(kv => kv.Key).ToList();
-        foreach (var k in toRemove) topologyLinks.Remove(k);
+        var toRemove = topologyLinks.Where(kv => kv.Value.LeaderIp == ip || kv.Value.FollowerIp == ip).ToList();
+        foreach (var kv in toRemove) {
+            var link = kv.Value;
+            if (link.LeaderIp == ip) {
+                // The Follower loses its confirmed parent, so a GM mismatch it was reported for can never be
+                // re-evaluated against it (the link is gone): end that episode now instead of leaving it open.
+                DeviceInfo followerDev; ProtocolState followerState;
+                if (devices.TryGetValue(link.FollowerIp, out followerDev) && followerDev.Protocols.TryGetValue(StateKey(link.Version, link.Domain), out followerState)) EndGmMismatch(followerState, link.FollowerIp, "parent device removed");
+            }
+            topologyLinks.Remove(kv.Key);
+        }
+    }
+
+    /// <summary>
+    /// Removes a device (retention expiry, LRU eviction, "Clear Offline") and first closes every open episode it
+    /// takes part in, so the history never keeps an episode open for a device that no longer exists.
+    /// Must be called while holding lock(devices).
+    /// </summary>
+    static void RemoveDevice(string ip, string why) {
+        DeviceInfo dev;
+        if (devices.TryGetValue(ip, out dev)) {
+            foreach (var ps in dev.Protocols.Values) { EndGmMismatch(ps, ip, why); EndAnnounceStale(ps, ip, why); }
+        }
+        RemoveDeviceLinks(ip);
+        devices.Remove(ip);
+    }
+
+    static bool MarkEpisode(Dictionary<string, long> reported, string key, long now) {
+        if (reported.ContainsKey(key)) return false;
+        reported[key] = now;
+        return true;
     }
 
     /// <summary>
@@ -717,7 +880,7 @@ class Program {
                     foreach (var d in devices.Values) {
                         if (d.LastSeenTicks < oldestTicks) { oldestTicks = d.LastSeenTicks; oldestIp = d.IP; }
                     }
-                    if (oldestIp != null) { RemoveDeviceLinks(oldestIp); devices.Remove(oldestIp); }
+                    if (oldestIp != null) RemoveDevice(oldestIp, "device evicted (table full)");
                 }
                 devices[ip] = new DeviceInfo(ip);
             }
@@ -726,7 +889,7 @@ class Program {
             if (!dev.IsOnline) {
                 dev.IsOnline = true;
                 dev.OnlineSinceTicks = now;
-                Log(string.Format("[REJOIN] {0} ({1}) responded again after being offline.", GetVendorSafe(dev.Mac), ip));
+                LogEvent("REJOIN", "REJOIN", "info", ip, "", "", string.Format("{0} ({1}) responded again after being offline.", GetVendorSafe(dev.Mac), ip));
             }
             if (dev.Mac == "Unknown" && ownId.Length >= 12) {
                 // Try to derive MAC from OwnId (UI purpose)
@@ -753,7 +916,7 @@ class Program {
                 // Announce timing belongs to the previous identity: the new one must announce for itself
                 // before it can be judged (applies even while the old identity still looked online).
                 pState.LastAnnounceTicks = null; pState.AnnounceLog = null;
-                pState.AnnounceStale = false; pState.AnnounceStaleLogged = false;
+                EndAnnounceStale(pState, ip, "clock identity changed");
                 // If the previous identity had already gone offline, the new one is a replacement device, not
                 // the old one speaking again: it must not inherit the old Role / GM / mechanism markers (a
                 // stale Leader role would otherwise also stop a role-less P2P replacement from being kept
@@ -771,7 +934,7 @@ class Program {
                     pState.GmAccuracy = null; pState.GmVariance = null; pState.StepsRemoved = null;
                     pState.TimeSource = null; pState.UtcOffset = null; pState.TimeFlags = null;
                     pState.SyncLog = null; pState.AnnounceLog = null; pState.LastAnnounceTicks = null;
-                    pState.AnnounceStale = false; pState.AnnounceStaleLogged = false;
+                    EndAnnounceStale(pState, ip, "clock identity changed");
                     pState.RoleChangedAtTicks = null;
                 }
             }
@@ -815,7 +978,7 @@ class Program {
                     // Only a previously wire-verified GM counts as a "change"; the provisional self-ID
                     // a Leader gets before its first GM report is not a real earlier GM.
                     if (pState.GmVerified && pState.GrandmasterId != v1GmId) {
-                        Log(string.Format("[GM_CHANGE] {0} v1 GM {1} -> {2}", ip, pState.GrandmasterId, v1GmId));
+                        LogEvent("GM_CHANGE", "GM_CHANGE", "info", ip, "v1", domain, string.Format("{0} v1 GM {1} -> {2}", ip, pState.GrandmasterId, v1GmId));
                     }
                     pState.GrandmasterId = v1GmId;
                     pState.GmVerified = true;
@@ -870,7 +1033,7 @@ class Program {
                 pState.TimeSource = len >= 64 ? (int?)data[63] : null;
                 string gmId = BitConverter.ToString(data, 53, 8).Replace("-","");
                 if (pState.GmVerified && pState.GrandmasterId != gmId) {
-                    Log(string.Format("[GM_CHANGE] {0} v2 GM {1} -> {2}", ip, pState.GrandmasterId, gmId));
+                    LogEvent("GM_CHANGE", "GM_CHANGE", "info", ip, "v2", domain, string.Format("{0} v2 GM {1} -> {2}", ip, pState.GrandmasterId, gmId));
                 }
                 pState.GrandmasterId = gmId;
                 pState.GmVerified = true;
@@ -900,8 +1063,8 @@ class Program {
                 pState.LastDelayReqSeenTicks = now;
             }
 
-            if (!dev.HasJoined) { dev.HasJoined = true; Log(string.Format("[JOIN] {0} ({1}) joined as {2}", ip, dev.Mac, role)); }
-            if (oldRole != role && role != "Unknown") { pState.RoleChangedAtTicks = now; Log(string.Format("[ROLE_CHANGE] {0} ({1}) {2} -> {3}", ip, protoVer, oldRole, role)); }
+            if (!dev.HasJoined) { dev.HasJoined = true; LogEvent("JOIN", "JOIN", "info", ip, "", "", string.Format("{0} ({1}) joined as {2}", ip, dev.Mac, role)); }
+            if (oldRole != role && role != "Unknown") { pState.RoleChangedAtTicks = now; LogEvent("ROLE_CHANGE", "ROLE_CHANGE", "info", ip, protoVer, domain, string.Format("{0} ({1}) {2} -> {3}", ip, protoVer, oldRole, role)); }
         }
     }
 
@@ -940,7 +1103,8 @@ class Program {
                         // Pdelay packet instead, since it never sends role-defining packets.
                         if (pState.IsOnline && ElapsedSeconds(LastLiveTicks(pState)) >= OfflineTimeoutSeconds) {
                             pState.IsOnline = false;
-                            pState.IsConflict = false; pState.ConflictStartedAtTicks = null; pState.GmMismatchLogged = false;
+                            pState.IsConflict = false; pState.ConflictStartedAtTicks = null;
+                            EndGmMismatch(pState, dev.IP, "instance went offline");
                             // A stale verification must not survive an outage: if this instance comes back
                             // sending only Sync (e.g. now under a different GM) it counts as unverified
                             // until a fresh Announce / v1 Sync body confirms its GM again.
@@ -965,14 +1129,15 @@ class Program {
                             announceStale = sinceAnnounce > annLimit;
                             if (announceStale && !pState.AnnounceStaleLogged) {
                                 pState.AnnounceStaleLogged = true;
-                                Log(string.Format("[ANNOUNCE_TIMEOUT] {0} (v2, domain {1}) Leader has sent no Announce for {2}s (limit {3}s = {4} x 2^{5}s) but is still active.", dev.IP, pState.Domain, sinceAnnounce.ToString("0.#", CultureInfo.InvariantCulture), annLimit.ToString("0.##", CultureInfo.InvariantCulture), AnnounceReceiptTimeout.ToString("0.##", CultureInfo.InvariantCulture), pState.AnnounceLog.Value));
+                                pState.AnnounceStaleSinceTicks = now;
+                                LogEvent("ANNOUNCE_TIMEOUT", "ANNOUNCE_TIMEOUT_START", "warn", dev.IP, "v2", pState.Domain, string.Format("{0} (v2, domain {1}) Leader has sent no Announce for {2}s (limit {3}s = {4} x 2^{5}s) but is still active.", dev.IP, pState.Domain, sinceAnnounce.ToString("0.#", CultureInfo.InvariantCulture), annLimit.ToString("0.##", CultureInfo.InvariantCulture), AnnounceReceiptTimeout.ToString("0.##", CultureInfo.InvariantCulture), pState.AnnounceLog.Value));
                             }
                         }
                         pState.AnnounceStale = announceStale;
-                        if (!announceStale) pState.AnnounceStaleLogged = false;
+                        if (!announceStale && pState.AnnounceStaleLogged) EndAnnounceStale(pState, dev.IP, !pState.IsOnline ? "Leader went offline" : (pState.Role != "Leader" ? "no longer a Leader" : "Announce resumed"));
                     }
                     double idle = ElapsedSeconds(dev.LastSeenTicks);
-                    if (idle >= OfflineTimeoutSeconds && dev.IsOnline) { dev.IsOnline = false; Log(string.Format("[OFFLINE] {0} ({1}) stopped responding.", GetVendorSafe(dev.Mac), dev.IP)); }
+                    if (idle >= OfflineTimeoutSeconds && dev.IsOnline) { dev.IsOnline = false; LogEvent("OFFLINE", "OFFLINE", "warn", dev.IP, "", "", string.Format("{0} ({1}) stopped responding.", GetVendorSafe(dev.Mac), dev.IP)); }
                     if (OfflineRetentionHours > 0 && idle >= (OfflineRetentionHours * 3600.0)) toRemove.Add(dev.IP);
                 }
 
@@ -1006,12 +1171,33 @@ class Program {
                             if (!pState.ConflictStartedAtTicks.HasValue) pState.ConflictStartedAtTicks = now;
                             double sec = ElapsedSeconds(pState.ConflictStartedAtTicks.Value);
                             if (sec >= ConflictPersistThresholdSeconds) {
-                                if (!pState.IsConflict) Log(string.Format("[CONFLICT_ALERT] Domain {0} ({1}) Persistent conflict detected ({2}s+): multiple Grandmasters {3}.", pState.Domain, pState.Version, ConflictPersistThresholdSeconds.ToString("0.##", CultureInfo.InvariantCulture), string.Join(", ", gmIds.ToArray())));
+                                if (!pState.IsConflict) {
+                                    string conflictMsg = string.Format("Domain {0} ({1}) Persistent conflict detected ({2}s+): multiple Grandmasters {3}.", pState.Domain, pState.Version, ConflictPersistThresholdSeconds.ToString("0.##", CultureInfo.InvariantCulture), string.Join(", ", gmIds.ToArray()));
+                                    Log("[CONFLICT_ALERT] " + conflictMsg);   // one line per Leader instance, exactly as before
+                                    // ...but ONE event per domain episode, however many Leaders are involved.
+                                    string conflictKey = StateKey(pState.Version, pState.Domain);
+                                    if (!conflictEpisodes.ContainsKey(conflictKey)) {
+                                        conflictEpisodes[conflictKey] = now;
+                                        Emit("CONFLICT_START", "alert", "", pState.Version, pState.Domain, conflictMsg);
+                                    }
+                                }
                                 pState.IsConflict = true;
                             }
                         } else {
                             pState.ConflictStartedAtTicks = null; pState.IsConflict = false;
                         }
+                    }
+                }
+
+                // A Conflict episode ends when NO instance of the domain is in conflict any more. IsConflict is
+                // cleared by every way out (the GMs agree again, a Leader goes offline or stops being a Leader), so
+                // scanning the flags catches them all.
+                if (conflictEpisodes.Count > 0) {
+                    var conflictedNow = new HashSet<string>();
+                    foreach (var dev in devices.Values) foreach (var ps in dev.Protocols.Values) if (ps.IsConflict) conflictedNow.Add(StateKey(ps.Version, ps.Domain));
+                    foreach (var ck in conflictEpisodes.Keys.Where(k => !conflictedNow.Contains(k)).ToList()) {
+                        EmitDomainEnd("CONFLICT_END", ck, "conflict over", conflictEpisodes[ck]);
+                        conflictEpisodes.Remove(ck);
                     }
                 }
 
@@ -1054,10 +1240,15 @@ class Program {
                     if (!mechMismatchSince.TryGetValue(mg.Key, out since)) { since = now; mechMismatchSince[mg.Key] = since; }
                     if (ElapsedSeconds(since) >= ConflictPersistThresholdSeconds) {
                         foreach (var pState in mg.Value) pState.MechMismatch = true;
-                        if (mechMismatchLogged.Add(mg.Key)) Log(string.Format("[DELAY_MECH_MISMATCH] Domain {0} ({1}): both E2E ({2} devices) and P2P ({3} devices) delay mechanisms observed ({4}s+).", mg.Value[0].Domain, mg.Value[0].Version, e2eCount, p2pCount, ConflictPersistThresholdSeconds.ToString("0.##", CultureInfo.InvariantCulture)));
+                        if (MarkEpisode(mechMismatchLogged, mg.Key, now)) LogEvent("DELAY_MECH_MISMATCH", "DELAY_MIX_START", "warn", "", mg.Value[0].Version, mg.Value[0].Domain, string.Format("Domain {0} ({1}): both E2E ({2} devices) and P2P ({3} devices) delay mechanisms observed ({4}s+).", mg.Value[0].Domain, mg.Value[0].Version, e2eCount, p2pCount, ConflictPersistThresholdSeconds.ToString("0.##", CultureInfo.InvariantCulture)));
                     }
                 }
-                foreach (var k in mechMismatchSince.Keys.Where(k => !mixedKeys.Contains(k)).ToList()) { mechMismatchSince.Remove(k); mechMismatchLogged.Remove(k); }
+                foreach (var k in mechMismatchSince.Keys.Where(k => !mixedKeys.Contains(k)).ToList()) {
+                    long mechReported;
+                    // The duration is counted from the START event (the same origin for every episode type).
+                    if (mechMismatchLogged.TryGetValue(k, out mechReported)) { EmitDomainEnd("DELAY_MIX_END", k, "E2E/P2P mix over", mechReported); mechMismatchLogged.Remove(k); }
+                    mechMismatchSince.Remove(k);
+                }
 
                 // Announce-interval mismatch: the Leaders of one v2 domain announcing at different intervals.
                 // Only a WARNING: linuxptp's documentation says the Announce interval "should be the same in
@@ -1085,10 +1276,21 @@ class Program {
                     if (!intervalMismatchSince.TryGetValue(ag.Key, out sinceI)) { sinceI = now; intervalMismatchSince[ag.Key] = sinceI; }
                     if (ElapsedSeconds(sinceI) >= ConflictPersistThresholdSeconds) {
                         foreach (var pState in ag.Value) pState.IntervalMismatch = true;
-                        if (intervalMismatchLogged.Add(ag.Key)) Log(string.Format("[INTERVAL_MISMATCH] Domain {0} ({1}): Leaders announce at different intervals ({2}); the Announce interval should be the same across a domain.", ag.Value[0].Domain, ag.Value[0].Version, string.Join(", ", logs.Select(l => "2^" + l.ToString(CultureInfo.InvariantCulture) + " s").ToArray())));
+                        if (MarkEpisode(intervalMismatchLogged, ag.Key, now)) LogEvent("INTERVAL_MISMATCH", "INTERVAL_MISMATCH_START", "warn", "", ag.Value[0].Version, ag.Value[0].Domain, string.Format("Domain {0} ({1}): Leaders announce at different intervals ({2}); the Announce interval should be the same across a domain.", ag.Value[0].Domain, ag.Value[0].Version, string.Join(", ", logs.Select(l => "2^" + l.ToString(CultureInfo.InvariantCulture) + " s").ToArray())));
                     }
                 }
-                foreach (var k in intervalMismatchSince.Keys.Where(k => !intervalKeys.Contains(k)).ToList()) { intervalMismatchSince.Remove(k); intervalMismatchLogged.Remove(k); }
+                foreach (var k in intervalMismatchSince.Keys.Where(k => !intervalKeys.Contains(k)).ToList()) {
+                    long intervalReported;
+                    if (intervalMismatchLogged.TryGetValue(k, out intervalReported)) {
+                        // Say what actually happened: either the Leaders still being compared now agree, or there
+                        // are no longer two Leaders to compare (one went offline, stopped announcing, or changed role).
+                        List<ProtocolState> stillCompared;
+                        bool agreed = annGroups.TryGetValue(k, out stillCompared) && stillCompared.Count >= 2;
+                        EmitDomainEnd("INTERVAL_MISMATCH_END", k, agreed ? "Announce intervals agree again" : "fewer than two Leaders left to compare (one went offline, stopped announcing or changed role)", intervalReported);
+                        intervalMismatchLogged.Remove(k);
+                    }
+                    intervalMismatchSince.Remove(k);
+                }
 
                 // Expire confirmed topology links whose Leader is no longer valid (offline, or no
                 // longer Leader in that domain), or that haven't been reconfirmed by a fresh
@@ -1110,7 +1312,7 @@ class Program {
                         // silently suppressed by a guard left over from this now-defunct link.
                         DeviceInfo staleFollowerDev;
                         ProtocolState staleFollowerState;
-                        if (devices.TryGetValue(link.FollowerIp, out staleFollowerDev) && staleFollowerDev.Protocols.TryGetValue(key, out staleFollowerState)) staleFollowerState.GmMismatchLogged = false;
+                        if (devices.TryGetValue(link.FollowerIp, out staleFollowerDev) && staleFollowerDev.Protocols.TryGetValue(key, out staleFollowerState)) EndGmMismatch(staleFollowerState, link.FollowerIp, "parent link expired");
                         continue;
                     }
 
@@ -1120,24 +1322,24 @@ class Program {
                     // A confirmed link only describes a Follower relationship; if this instance has
                     // since become a Leader itself (e.g. after a BMCA re-election) it is no longer
                     // "following" anyone, so evaluating a mismatch against the old parent is meaningless.
-                    if (followerState.Role != "Follower") { followerState.GmMismatchLogged = false; continue; }
+                    if (followerState.Role != "Follower") { EndGmMismatch(followerState, link.FollowerIp, "no longer a Follower"); continue; }
 
                     bool mismatch = followerState.GrandmasterId != null && leaderState.GrandmasterId != null && followerState.GrandmasterId != leaderState.GrandmasterId;
                     if (mismatch) {
                         if (!followerState.GmMismatchLogged) {
-                            Log(string.Format("[GM_MISMATCH] {0} ({1}) is following GM {2}, but its parent {3} follows GM {4}!", link.FollowerIp, link.Version, followerState.GrandmasterId, link.LeaderIp, leaderState.GrandmasterId));
+                            LogEvent("GM_MISMATCH", "GM_MISMATCH_START", "alert", link.FollowerIp, link.Version, link.Domain, string.Format("{0} ({1}) is following GM {2}, but its parent {3} follows GM {4}!", link.FollowerIp, link.Version, followerState.GrandmasterId, link.LeaderIp, leaderState.GrandmasterId));
                             followerState.GmMismatchLogged = true;
+                            followerState.GmMismatchSinceTicks = now;
                         }
                     } else {
-                        followerState.GmMismatchLogged = false;
+                        EndGmMismatch(followerState, link.FollowerIp, "GM agrees again");
                     }
                 }
                 foreach (var k in staleLinks) topologyLinks.Remove(k);
 
                 foreach(var k in toRemove) {
-                    Log("[LEAVE] " + devices[k].IP + " (Retention expired)");
-                    RemoveDeviceLinks(k);
-                    devices.Remove(k);
+                    LogEvent("LEAVE", "LEAVE", "warn", devices[k].IP, "", "", devices[k].IP + " (Retention expired)");
+                    RemoveDevice(k, "device removed (retention expired)");
                 }
             }
         }
@@ -1285,18 +1487,24 @@ class Program {
                 lock(devices) {
                     var toRemove = devices.Where(x => !x.Value.IsOnline).Select(x => x.Key).ToList();
                     count = toRemove.Count;
-                    foreach(var k in toRemove) {
-                        RemoveDeviceLinks(k);
-                        devices.Remove(k);
-                    }
+                    foreach(var k in toRemove) RemoveDevice(k, "device removed (Clear Offline)");
                 }
-                Log(string.Format("[SYSTEM] Offline devices cleared by WebUI ({0} nodes).", count));
+                LogEvent("SYSTEM", "SYSTEM", "info", "", "", "", string.Format("Offline devices cleared by WebUI ({0} nodes).", count));
                 res.StatusCode = 200;
             } else if (path == "/api/clear_all" && context.Request.HttpMethod == "POST") {
-                lock(devices) { devices.Clear(); topologyLinks.Clear(); domainGms.Clear(); gmHistoryLimitWarned = false; mechMismatchSince.Clear(); mechMismatchLogged.Clear(); intervalMismatchSince.Clear(); intervalMismatchLogged.Clear(); }
+                // State and history are cleared, and the SYSTEM event recorded, in ONE critical section: packets and sweeps
+                // take the same lock, so no new device/episode can be created in between and then lose its event
+                // (or keep a guard flag that suppresses its next START) while the history is emptied.
+                lock(devices) {
+                    devices.Clear(); topologyLinks.Clear(); domainGms.Clear(); gmHistoryLimitWarned = false; mechMismatchSince.Clear(); mechMismatchLogged.Clear(); intervalMismatchSince.Clear(); intervalMismatchLogged.Clear(); conflictEpisodes.Clear();
+                    events.Clear();   // new epoch: clients drop their copy of the history
+                    Emit("SYSTEM", "info", "", "", "", "Network state and logs cleared by WebUI.");
+                }
                 lock(logLock) { logs.Clear(); }
                 Log("[SYSTEM] Network state and logs cleared by WebUI.");
                 res.StatusCode = 200;
+            } else if (path == "/api/events" && context.Request.HttpMethod == "GET") {
+                ServeEvents(context);
             } else if (path == "/api/data") {
                 var sb = new StringBuilder();
                 sb.Append("{\"expectedDelayInterval\":").Append(JsonNum(ExpectedDelayInterval));
@@ -1417,6 +1625,97 @@ class Program {
         }
     }
 
+    // ===================== Event history API =====================
+
+    /// <summary>
+    /// CSV field escaping with the same rules as the dashboard's own export: quotes doubled, and a field that
+    /// would be read as a spreadsheet formula (after leading whitespace/control characters) gets a leading
+    /// apostrophe. PTPv1 subdomains come straight from packet bytes, so "=..." in a domain is possible.
+    /// </summary>
+    static string CsvEscape(string v) {
+        string s = (v ?? "").Replace("\"", "\"\"");
+        int i = 0;
+        while (i < s.Length && (char.IsWhiteSpace(s[i]) || s[i] < 0x20)) i++;
+        if (i < s.Length && (s[i] == '=' || s[i] == '+' || s[i] == '-' || s[i] == '@')) s = "'" + s;
+        return "\"" + s + "\"";
+    }
+
+    static string EventTime(DateTime t) { return t.ToString("yyyy-MM-dd'T'HH:mm:sszzz", CultureInfo.InvariantCulture); }
+
+    /// <summary>
+    /// GET /api/events?since=&lt;seq&gt;&amp;type=A,B&amp;ip=&amp;domain=&amp;limit=&amp;format=json|csv. Every parameter is validated strictly
+    /// (a bad value is a 400, never silently ignored).
+    /// </summary>
+    static void ServeEvents(HttpListenerContext context) {
+        var q = context.Request.QueryString;
+        var res = context.Response;
+        long since = 0; int limit = 1000; string format = "json", ip = null, domain = null;
+        HashSet<string> types = null;
+        string v = q["since"];
+        if (!string.IsNullOrEmpty(v) && !long.TryParse(v, NumberStyles.None, CultureInfo.InvariantCulture, out since)) { res.StatusCode = 400; return; }
+        v = q["limit"];
+        if (!string.IsNullOrEmpty(v) && (!int.TryParse(v, NumberStyles.None, CultureInfo.InvariantCulture, out limit) || limit < 1 || limit > MaxEventsPerRequest)) { res.StatusCode = 400; return; }
+        v = q["format"];
+        if (!string.IsNullOrEmpty(v)) { if (v != "json" && v != "csv") { res.StatusCode = 400; return; } format = v; }
+        v = q["type"];
+        if (!string.IsNullOrEmpty(v)) {
+            string[] parts = v.Split(',');
+            if (parts.Length > 24) { res.StatusCode = 400; return; }
+            types = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var t in parts) {
+                if (t.Length == 0 || t.Length > 40 || !t.All(c => (c >= 'A' && c <= 'Z') || c == '_')) { res.StatusCode = 400; return; }
+                types.Add(t);
+            }
+        }
+        v = q["ip"];
+        if (!string.IsNullOrEmpty(v)) { if (v.Length > 45 || !v.All(c => Uri.IsHexDigit(c) || c == '.' || c == ':')) { res.StatusCode = 400; return; } ip = v; }
+        v = q["domain"];
+        if (!string.IsNullOrEmpty(v)) { if (v.Length > 200) { res.StatusCode = 400; return; } domain = v; }
+
+        EventPage page = events.Query(since, types, ip, domain, limit);
+        byte[] body;
+        if (format == "csv") {
+            var sb = new StringBuilder();
+            sb.Append("seq,time,type,severity,ip,version,domain,message\r\n");
+            foreach (var e in page.Events) {
+                sb.Append(e.Seq.ToString(CultureInfo.InvariantCulture)).Append(',');
+                sb.Append(CsvEscape(EventTime(e.Time))).Append(',').Append(CsvEscape(e.Type)).Append(',').Append(CsvEscape(e.Severity)).Append(',');
+                sb.Append(CsvEscape(e.Ip)).Append(',').Append(CsvEscape(e.Version)).Append(',').Append(CsvEscape(e.Domain)).Append(',').Append(CsvEscape(e.Message)).Append("\r\n");
+            }
+            // UTF-8 BOM so older Excel reads non-ASCII text (e.g. a vendor name inside a message) correctly.
+            byte[] text = Encoding.UTF8.GetBytes(sb.ToString());
+            body = new byte[text.Length + 3];
+            body[0] = 0xEF; body[1] = 0xBB; body[2] = 0xBF;
+            Array.Copy(text, 0, body, 3, text.Length);
+            res.ContentType = "text/csv; charset=utf-8";
+            res.Headers.Add("Content-Disposition", "attachment; filename=\"ptp_events.csv\"");
+        } else {
+            var sb = new StringBuilder();
+            sb.Append("{\"session\":").Append(JsonStr(page.Session));
+            sb.Append(",\"epoch\":").Append(page.Epoch.ToString(CultureInfo.InvariantCulture));
+            sb.Append(",\"firstSeq\":").Append(page.FirstSeq.ToString(CultureInfo.InvariantCulture));
+            sb.Append(",\"lastSeq\":").Append(page.LastSeq.ToString(CultureInfo.InvariantCulture));
+            sb.Append(",\"total\":").Append(page.Total.ToString(CultureInfo.InvariantCulture));
+            sb.Append(",\"dropped\":").Append(page.Dropped.ToString(CultureInfo.InvariantCulture));
+            sb.Append(",\"capacity\":").Append(page.Capacity.ToString(CultureInfo.InvariantCulture));
+            sb.Append(",\"events\":[");
+            for (int i = 0; i < page.Events.Count; i++) {
+                var e = page.Events[i];
+                if (i > 0) sb.Append(",");
+                sb.Append("{\"seq\":").Append(e.Seq.ToString(CultureInfo.InvariantCulture));
+                sb.Append(",\"time\":").Append(JsonStr(EventTime(e.Time)));
+                sb.Append(",\"type\":").Append(JsonStr(e.Type)).Append(",\"severity\":").Append(JsonStr(e.Severity));
+                sb.Append(",\"ip\":").Append(JsonStr(e.Ip)).Append(",\"version\":").Append(JsonStr(e.Version)).Append(",\"domain\":").Append(JsonStr(e.Domain));
+                sb.Append(",\"message\":").Append(JsonStr(e.Message)).Append("}");
+            }
+            sb.Append("]}");
+            body = Encoding.UTF8.GetBytes(sb.ToString());
+            res.ContentType = "application/json";
+        }
+        res.ContentLength64 = body.Length;
+        res.OutputStream.Write(body, 0, body.Length);
+    }
+
     // ===================== Offline (pcap / pcapng) analysis =====================
 
     static ReplayStats analysis = null;               // non-null only in offline mode
@@ -1436,7 +1735,7 @@ class Program {
     /// </summary>
     static int RunOfflineMode(string pcapPath, bool summaryOnly, string portArg) {
         LoadConfig();
-        Console.WriteLine("=== PTPMonitor v1.14.0 (offline analysis) ===");
+        Console.WriteLine("=== PTPMonitor v1.15.0 (offline analysis) ===");
         if (!File.Exists(pcapPath)) { Console.Error.WriteLine("[ERROR] File not found: " + pcapPath); return 1; }
         if (portArg != null) {
             int p;
@@ -1445,6 +1744,7 @@ class Program {
             }
             WebPort = p.ToString(CultureInfo.InvariantCulture);
         }
+        events = new EventStore(OfflineEventCapacity);   // a capture can hold far more history than a live session
         consoleLog = summaryOnly;   // summary mode prints each event as it happens; dashboard mode keeps them in memory
         if (summaryOnly) Console.WriteLine("\n=== Events (capture time) ===");
         int rc = RunReplay(pcapPath);

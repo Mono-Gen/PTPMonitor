@@ -1,4 +1,4 @@
-# PTPMonitor User Manual (v1.14.0)
+# PTPMonitor User Manual (v1.15.0)
 
 PTPMonitor is a specialized protocol analyzer designed to capture PTP (Precision Time Protocol) v1 / v2 traffic, visualize device status, Boundary Clock (BC) operations, and network topology for high-precision diagnostic purposes.
 
@@ -96,6 +96,25 @@ Exit codes: `0` success (a truncated or partly damaged file still gives `0` with
 
 > [!NOTE]
 > This has been verified against hand-built capture files only; please check it with your own captures. Every packet in a capture goes through exactly the same processing as a live packet, so any difference from what you saw live is worth reporting.
+
+### 12. Event Timeline and Export
+The **Timeline** panel (above Event Logs) is a structured history of what started, changed and **ended**, newest first. The plain text event log is unchanged; the Timeline is a separate record that also remembers when a problem was *resolved*, so you can see how long it lasted.
+
+| Group | Events |
+|---|---|
+| Alerts | `CONFLICT_START` / `CONFLICT_END`, `GM_MISMATCH_START` / `GM_MISMATCH_END` |
+| Roles & GM | `ROLE_CHANGE`, `GM_CHANGE` |
+| Presence | `JOIN`, `REJOIN`, `OFFLINE`, `LEAVE`, `SYSTEM` (the Clear buttons) |
+| Timing | `DELAY_MIX_START/END`, `ANNOUNCE_TIMEOUT_START/END`, `INTERVAL_MISMATCH_START/END` |
+
+- **One event per episode**: a Conflict, a mixed delay mechanism or differing Announce intervals produce one `START` for the domain however many devices are involved (the text log still prints one line per Leader), and one `END` when it is over, with its duration counted from the `START` (`... after 24s`). A problem that comes back is a new episode. An episode also ends when the devices involved go offline or are removed from the list; a GM mismatch and an Announce timeout say why in the message, and an interval mismatch says whether the intervals agree again or there are no longer two Leaders to compare.
+- **Severity** is shown with an icon and a word (`⛔ ALERT`, `⚠ WARN`, `ℹ INFO`, `✔ RESOLVED`), not by colour alone.
+- **Filter** by group or search IP / domain / text. **Click a row** to jump to the node it is about (domain-level events jump to the first node of that domain).
+- **Export**: `⬇ JSON` and `⬇ CSV` download the whole retained history (up to 100,000 events per request). The CSV has a UTF-8 BOM, and a field that could be read as a spreadsheet formula is neutralized with a leading `'`. Times are ISO 8601 with the UTC offset, e.g. `2023-11-15T07:13:36+09:00`.
+- **Limits**: the last 5,000 events are kept in memory (50,000 when analyzing a capture). When older events had to be discarded, the panel says how many; nothing is dropped silently. The history is **not saved to disk** and is lost when the program stops; `↻ Network Clear` empties it (the Clear itself is recorded as a `SYSTEM` event).
+- **Capture analysis**: events carry the capture's own time. The Clear buttons are disabled, so the history of the capture stays.
+
+API: `GET /api/events?since=<seq>&type=A,B&ip=<ip>&domain=<d>&limit=<n>&format=json|csv`. `since` returns only newer events (this is how the page polls), `limit` is 1–100000 (default 1000), and a malformed parameter is answered with `400`. The JSON carries `session` (changes when the program restarts, so the page re-syncs), `epoch` (changes on Network Clear), `firstSeq`, `lastSeq`, `total`, `dropped` and `capacity`.
 
 ## WebUI Operations
 - **Uptime / Offline**: Real-time display of uptime for active devices or elapsed time since disconnection for offline devices. Uptime resets (and a `[REJOIN]` log entry is added) when a device comes back online after being offline.

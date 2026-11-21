@@ -1,4 +1,4 @@
-# PTPMonitor User Manual (v1.14.0)
+# PTPMonitor User Manual (v1.16.0)
 
 PTPMonitor is a specialized protocol analyzer designed to capture PTP (Precision Time Protocol) v1 / v2 traffic, visualize device status, Boundary Clock (BC) operations, and network topology for high-precision diagnostic purposes.
 
@@ -11,6 +11,23 @@ PTPMonitor is a specialized protocol analyzer designed to capture PTP (Precision
 2. Select the network adapter index for monitoring.
 3. Specify the Web UI port (default: 8080).
 4. Open `http://localhost:8080/` in your browser.
+
+### Unattended start (no prompts)
+For a scheduled task or any start with nobody at the keyboard, give the interface up front. Nothing is asked then, and a wrong setting stops the program with an error instead of a silent default:
+
+```
+PTPMonitor.exe --nic 192.168.1.10 [--port 8080]   # --nic: exact IPv4 address, the number from the list, or text matching ONE adapter description
+PTPMonitor.exe --no-prompt                        # never prompt; the interface must come from --nic or config.ini (Nic)
+```
+`Nic`, `WebPort` and `WebBind` in `config.ini` do the same; the command line wins. Without `--nic`/`Nic` the program still asks, but if no console input exists at all (end of input) it exits with an error instead of silently choosing interface 1. Exit codes: `0` ok, `1` runtime failure (no interface, dashboard could not start, capture unreadable), `2` bad arguments or settings. `--version` and `--help` are available.
+
+`config.ini` is looked up in the working directory first, then next to the exe (so a task whose working directory is elsewhere still finds it). The log files are always written next to the exe. Packet capture still needs administrator rights; a Task Scheduler entry "run with highest privileges" is the expected setup (this has not been tested here).
+
+### Read-only remote view (`--bind`)
+`--bind <IP>` (or `WebBind`) makes the dashboard **also** listen on one extra local address, e.g. `--bind 192.168.1.10`, so other machines can watch it. Because that dashboard has **no authentication**, every instance started with `--bind` is **read-only**: the clear buttons are hidden and the clear endpoints answer 403, even for local requests. Use it only on a trusted network. Wildcards (`0.0.0.0`, `::`, `*`) and host names are refused. Listening on a non-loopback address may need administrator rights or a URL reservation (`netsh http add urlacl`); if it cannot start, the program says so and exits with `1` (the exact requirement was not verified).
+
+### Prometheus metrics (`/metrics`)
+`GET /metrics` returns the current state in the Prometheus text format (0.0.4): device counts (online/offline), Leader instances per PTP version, active conflicts / GM mismatches / Announce timeouts / delay-mechanism mixes / Announce-interval mismatches, the last agreed Grandmaster per domain (`ptpmonitor_domain_grandmaster_info`), packet counters, uptime and version. Only a small fixed set of series is produced (no per-device series). Point a scraper at `http://<host>:<port>/metrics` (with `--bind` for remote scraping).
 
 ## Key Diagnostic Features
 ### 1. High-Precision Topology Visualization
@@ -108,8 +125,8 @@ Exit codes: `0` success (a truncated or partly damaged file still gives `0` with
 
 ## Logs and Maintenance
 - **Log File Location**:
-    - **Current Log**: Recorded in `ptp_monitor.log` in the project root.
-    - **Archived Logs**: Automatically stored in the `logs/` folder with timestamps (rotation).
+    - **Current Log**: Recorded in `ptp_monitor.log` next to the exe.
+    - **Archived Logs**: Automatically stored in the `logs/` folder next to the exe with timestamps (rotation).
 - **Auto-Rotation**: Performed on startup or when the log file size exceeds 10MB.
 
 ## Advanced Configuration (config.ini)
@@ -118,8 +135,9 @@ Exit codes: `0` success (a truncated or partly damaged file still gives `0` with
 - **DelayAlertThresholdRate**: Tolerance multiplier for alerting (default 1.5). UI highlights red if actual interval > (Expected * Rate).
 - **OfflineTimeoutSeconds**: Seconds of inactivity before a node is marked as offline (default 10.0s).
 - **AnnounceReceiptTimeout**: Number of missed Announce intervals before an otherwise active Leader is reported as not announcing (default 3, range 2–255; same meaning and default as linuxptp's `announceReceiptTimeout`). Out-of-range values are ignored.
+- **Nic** / **WebPort** / **WebBind**: Same as `--nic` / `--port` / `--bind` (see "Unattended start"). An invalid value is an error (exit code 2), not ignored.
 - **OUI Vendor Mapping**: Vendor name definitions based on MAC address prefix (OUI).
 - **Specific Device Mapping**: Manually assign names or hostnames to specific MAC addresses.
 
 > [!NOTE]
-> If a numeric setting contains an invalid value (e.g., a non-numeric string), that entry is ignored and the default value is kept (a `[WARN]` message is printed to the console on startup). Always use a period (`.`) as the decimal separator regardless of your OS locale.
+> If a threshold setting (the numeric ones above, not Nic/WebPort/WebBind) contains an invalid value (e.g., a non-numeric string), that entry is ignored and the default value is kept (a `[WARN]` message is printed to the console on startup). Always use a period (`.`) as the decimal separator regardless of your OS locale.

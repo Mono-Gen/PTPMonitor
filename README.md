@@ -18,6 +18,15 @@ Run `PTPMonitor.exe` (requires proper configuration in `config.ini`). To analyze
 
 ## Changelog
 
+### [v1.16.0] - 2026-11-21
+#### Added
+- **Unattended start**: `--nic <IPv4|number|description text>`, `--port N`, `--no-prompt`, `--version`, `--help`, and `Nic` / `WebPort` / `WebBind` in `config.ini` (the command line wins). With the interface given nothing is prompted. A bad value, an ambiguous or unknown interface, or a dashboard that cannot start is an error (exit codes: 0 ok, 1 runtime failure, 2 bad arguments/settings) instead of a silent default. With no console input at all (end of input) the program exits with an error instead of silently choosing interface 1.
+- **Read-only remote view**: `--bind <IP>` / `WebBind` also serves the dashboard on one extra local address. As that dashboard has no authentication, such an instance is read-only (clear endpoints answer 403, clear buttons hidden). Wildcards and host names are refused. Listening on a non-loopback address may need administrator rights or a URL reservation (not verified).
+- **`/metrics`**: Prometheus text format 0.0.4 with a small fixed set of series (devices, Leaders, active conflicts / GM mismatches / Announce timeouts / mechanism mixes / interval mismatches, last agreed Grandmaster per domain, packet counters, uptime, version); no per-device series.
+#### Changed
+- The log file and `logs/` are now written next to the exe (previously the working directory, which for a scheduled task is not the install folder). `config.ini` is read from the working directory first (as before), then from the exe folder.
+- Verified with scratch harnesses and on one Windows machine only; running as a Task Scheduler job and non-loopback `--bind` were not tested end to end.
+
 ### [v1.14.0] - 2026-11-21
 #### Added
 - **Offline analysis of pcap / pcapng captures**: `PTPMonitor.exe --pcap <file> [--port N]` replays a capture through the same parser and the same periodic evaluation as live monitoring and shows the (frozen) result on the dashboard; `--summary` prints the events and a device table and exits (exit codes: 0 ok, 1 unreadable capture, 2 bad arguments). Classic pcap (µs/ns, both byte orders) and pcapng (both byte orders, several sections, `if_tsresol`/`if_tsoffset`); Ethernet (up to two VLAN tags), raw IP and raw IPv4. Packets that cannot be analyzed (IPv6, Layer-2 PTP, fragments, non-UDP, other ports, oversize UDP, unsupported link types such as Linux cooked) are counted by reason, never guessed. The dashboard shows an analysis banner, the clear buttons are disabled and the clear API answers 409.

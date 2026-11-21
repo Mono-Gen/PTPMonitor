@@ -91,12 +91,13 @@ document.addEventListener('toggle', e => {
 
 // Offline (pcap) analysis: the dashboard shows a FIXED result, so the live indicator, the clear buttons and
 // the "last update" time are replaced by a banner describing the capture. `a` is null in live mode.
-function applyAnalysis(a) {
+function applyAnalysis(a, readOnly) {
     const on = !!a;
     document.body.classList.toggle('analysis', on);
     const live = document.getElementById('liveLabel');
-    if (live) live.innerText = on ? 'OFFLINE ANALYSIS' : 'LIVE MONITORING';
-    ['btnClearAll', 'btnClearOffline'].forEach(id => { const b = document.getElementById(id); if (b) b.style.display = on ? 'none' : ''; });
+    if (live) live.innerText = on ? 'OFFLINE ANALYSIS' : (readOnly ? 'LIVE MONITORING · READ-ONLY' : 'LIVE MONITORING');
+    // A read-only dashboard (started with --bind) serves nothing that changes state, so the buttons would only fail.
+    ['btnClearAll', 'btnClearOffline'].forEach(id => { const b = document.getElementById(id); if (b) b.style.display = (on || readOnly) ? 'none' : ''; });
     const el = document.getElementById('analysisBanner');
     if (!el) return;
     if (!on) { el.innerHTML = ''; return; }
@@ -118,7 +119,7 @@ function applySearchFilter() {
 async function fetchUI() {
     try {
         const r = await fetch('/api/data'); const d = await r.json();
-        applyAnalysis(d.analysis);
+        applyAnalysis(d.analysis, d.readOnly);
         const counts = { nodes: 0, leaders: 0, bcs: 0, conflicts: 0, v1f: 0, v2f: 0 };
 
         d.devices.forEach(dev => {

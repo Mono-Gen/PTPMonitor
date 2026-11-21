@@ -89,6 +89,25 @@ document.addEventListener('toggle', e => {
     if (t.open) historyOpen.add(t.dataset.key); else historyOpen.delete(t.dataset.key);
 }, true);
 
+// Offline (pcap) analysis: the dashboard shows a FIXED result, so the live indicator, the clear buttons and
+// the "last update" time are replaced by a banner describing the capture. `a` is null in live mode.
+function applyAnalysis(a) {
+    const on = !!a;
+    document.body.classList.toggle('analysis', on);
+    const live = document.getElementById('liveLabel');
+    if (live) live.innerText = on ? 'OFFLINE ANALYSIS' : 'LIVE MONITORING';
+    ['btnClearAll', 'btnClearOffline'].forEach(id => { const b = document.getElementById(id); if (b) b.style.display = on ? 'none' : ''; });
+    const el = document.getElementById('analysisBanner');
+    if (!el) return;
+    if (!on) { el.innerHTML = ''; return; }
+    const range = a.first ? `${esc(a.first)} → ${esc(a.last)}` : 'no timestamps';
+    const skipped = (a.skipped || []).map(s => `${esc(s.count)} × ${esc(s.reason)}`).join(' · ');
+    const warns = (a.warnings || []).map(w => `<div class="analysis-warn">⚠ ${esc(w)}</div>`).join('');
+    el.innerHTML = `<div class="analysis-banner"><strong>Offline analysis</strong> — ${esc(a.file)} · ${range} · ` +
+        `${esc(a.packets)} packets read, ${esc(a.fed)} PTP candidates fed to the parser` +
+        (skipped ? `<div class="analysis-skipped">Skipped: ${skipped}</div>` : '') + warns + `</div>`;
+}
+
 function applySearchFilter() {
     const term = document.getElementById('searchBox').value.trim().toLowerCase();
     document.querySelectorAll('.node[data-search]').forEach(el => {
@@ -99,6 +118,7 @@ function applySearchFilter() {
 async function fetchUI() {
     try {
         const r = await fetch('/api/data'); const d = await r.json();
+        applyAnalysis(d.analysis);
         const counts = { nodes: 0, leaders: 0, bcs: 0, conflicts: 0, v1f: 0, v2f: 0 };
 
         d.devices.forEach(dev => {
@@ -128,7 +148,7 @@ async function fetchUI() {
 
         const stats = [['Active Nodes', counts.nodes], ['Leaders', counts.leaders], ['v1/v2 Followers', `${counts.v1f}/${counts.v2f}`], ['Boundary Clocks (bc)', counts.bcs], ['Conflicts', counts.conflicts]];
         document.getElementById('dash').innerHTML = stats.map(s => `<div class="dash-item"><div style="color:#aaa">${s[0]}</div><div class="dash-value">${s[1]}</div></div>`).join('');
-        document.getElementById('last-update').innerText = 'Last Update: ' + new Date().toLocaleTimeString();
+        document.getElementById('last-update').innerText = d.analysis ? 'Frozen at the end of the capture' : 'Last Update: ' + new Date().toLocaleTimeString();
 
         const alerts = [];
         const mechAlerted = new Set(); // one banner entry per mixed (version, domain), not per node

@@ -37,6 +37,10 @@ button:hover{border-color:var(--accent);}
 .unconfirmed-note{opacity:0.5;font-size:0.7em;margin-left:4px;}
 .node.mech-warn:not(.conflict){border:1px solid #ffcc00;}
 .alert-item.warn{color:#ffcc00;}
+.analysis-banner{background:rgba(0,210,255,0.07);border:1px solid var(--accent);border-radius:12px;padding:0.8rem 1rem;margin-bottom:1.5rem;font-size:0.8rem;}
+.analysis-skipped{color:#aaa;font-size:0.72rem;margin-top:4px;}
+.analysis-warn{color:#ffcc00;margin-top:4px;}
+body.analysis .dot{animation:none;opacity:0.5;}
 .profile-hint{font-weight:normal;font-size:0.75rem;color:#aaa;opacity:0.8;}
 .gm-history{margin-bottom:0.8rem;font-size:0.8rem;color:#aaa;}
 .gm-history summary{cursor:pointer;color:#ffcc00;}

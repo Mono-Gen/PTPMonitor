@@ -216,16 +216,29 @@ class Program {
     static Dictionary<string, string> customVendors = new Dictionary<string, string>();
     static IPAddress currentLocalIp = IPAddress.Any;
     static HttpListener httpListener = new HttpListener();
+    // Live mode echoes every log line to the console; the offline dashboard mode turns that off (the
+    // lines are still kept in the in-memory log shown on the dashboard).
+    static bool consoleLog = true;
 
     /// <summary>
     /// Monotonic timestamp (not affected by NTP corrections or manual clock changes) for
     /// duration/elapsed-time math. Absolute wall-clock display (log timestamps) still uses
     /// DateTime.Now separately.
     /// </summary>
-    public static long NowTicks() { return Stopwatch.GetTimestamp(); }
+    public static long NowTicks() { return replayTicks.HasValue ? replayTicks.Value : Stopwatch.GetTimestamp(); }
+
+    // Offline (pcap) analysis drives time from the capture's own timestamps instead of the real clock, so
+    // every timer-based diagnosis (offline, conflict persistence, Announce timeout, ...) plays out on the
+    // capture's timeline. Both are null in live mode. They are written only by the single-threaded replay
+    // driver; after replay they stay FROZEN at the capture's end while the dashboard is served.
+    static long? replayTicks = null;
+    static DateTime? replayWall = null;
+
+    /// <summary>Wall-clock time for display (log lines, history rows): real time live, capture time in replay.</summary>
+    static DateTime WallNow() { return replayWall.HasValue ? replayWall.Value.ToLocalTime() : DateTime.Now; }   // replayWall holds UTC
 
     public static double ElapsedSeconds(long fromTicks) {
-        return (double)(Stopwatch.GetTimestamp() - fromTicks) / Stopwatch.Frequency;
+        return (double)(NowTicks() - fromTicks) / Stopwatch.Frequency;
     }
 
     static string StateKey(string version, string domain) { return version + KeySep + domain; }
@@ -247,9 +260,24 @@ class Program {
     /// <summary>
     /// Entry point. Handles interface selection and starts monitoring tasks.
     /// </summary>
-    static void Main(string[] args) {
+    static int Main(string[] args) {
+        string pcapPath = null, portArg = null;
+        bool summaryOnly = false;
+        for (int i = 0; i < args.Length; i++) {
+            string a = args[i];
+            // An option that takes a value must be followed by one: another "--option" is not a value.
+            bool hasValue = i + 1 < args.Length && !args[i + 1].StartsWith("--", StringComparison.Ordinal);
+            if (a == "--pcap" && hasValue) pcapPath = args[++i];
+            else if (a == "--port" && hasValue) portArg = args[++i];
+            else if (a == "--summary") summaryOnly = true;
+            else if (a == "--help" || a == "-h" || a == "/?") { PrintUsage(); return 0; }
+            else { Console.Error.WriteLine("Unknown or incomplete argument: " + a); PrintUsage(); return 2; }
+        }
+        if (summaryOnly && pcapPath == null) { Console.Error.WriteLine("--summary requires --pcap <file>"); PrintUsage(); return 2; }
+        if (pcapPath != null) return RunOfflineMode(pcapPath, summaryOnly, portArg);
+
         LoadConfig();
-        Console.WriteLine("=== PTPMonitor v1.13.0 ===");
+        Console.WriteLine("=== PTPMonitor v1.14.0 ===");
 
         NetworkInterface[] nics = NetworkInterface.GetAllNetworkInterfaces();
         List<IPAddress> validIps = new List<IPAddress>();
@@ -268,7 +296,7 @@ class Program {
             }
         }
 
-        if (validIps.Count == 0) { Console.WriteLine("Error: No valid IPv4 interfaces found."); return; }
+        if (validIps.Count == 0) { Console.WriteLine("Error: No valid IPv4 interfaces found."); return 1; }
         Console.Write(string.Format("\nSelect NIC Number (1-{0}) [Default: 1]: ", validIps.Count));
         string input = Console.ReadLine();
         int selIndex = 1;
@@ -347,7 +375,7 @@ class Program {
 
         if (sockets.Count == 0) {
             Log("[ERROR] No PTP ports could be opened. Exiting.");
-            return;
+            return 1;
         }
 
         Console.WriteLine("\nStarting monitoring on {0}...", currentLocalIp);
@@ -373,6 +401,7 @@ class Program {
         };
 
         while (!cts.Token.IsCancellationRequested) Thread.Sleep(100);
+        return 0;
     }
 
     /// <summary>
@@ -477,10 +506,10 @@ class Program {
     /// Outputs message to console and log file. Keeps a short history in memory.
     /// </summary>
     static void Log(string message) {
-        string timestamp = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
+        string timestamp = WallNow().ToString("yyyy-MM-dd HH:mm:ss");
         string clean = string.Format("[{0}] {1}", timestamp, System.Text.RegularExpressions.Regex.Replace(message, @"\x1B\[[^m]*m", ""));
         lock(printLock) {
-            Console.WriteLine(string.Format("[{0}] {1}", timestamp, message));
+            if (consoleLog) Console.WriteLine(string.Format("[{0}] {1}", timestamp, message));
             if(logWriter != null) {
                 // Swallowed intentionally: logging must never crash monitoring, and
                 // reporting a log-write failure via Log() would recurse.
@@ -551,7 +580,7 @@ class Program {
         }
         st.LastSeenTicks = now;
         if (singleGm == null || singleGm == st.Gm) return;
-        st.Events.Add(new GmChangeEvent { Time = DateTime.Now.ToString("HH:mm:ss", CultureInfo.InvariantCulture), OldGm = st.Gm, NewGm = singleGm });
+        st.Events.Add(new GmChangeEvent { Time = WallNow().ToString("HH:mm:ss", CultureInfo.InvariantCulture), OldGm = st.Gm, NewGm = singleGm });
         if (st.Events.Count > MaxGmHistoryPerDomain) st.Events.RemoveAt(0);
         st.Gm = singleGm;
     }
@@ -885,6 +914,18 @@ class Program {
     /// </summary>
     static void MonitorLoop() {
         while(!cts.Token.IsCancellationRequested) {
+            SweepOnce();
+            Thread.Sleep(1000);
+        }
+    }
+
+    /// <summary>
+    /// One pass of the periodic evaluation (everything MonitorLoop used to do once per second). Extracted so the
+    /// offline (pcap) replay can run the very same logic on the capture's virtual clock; time is always read
+    /// through NowTicks()/ElapsedSeconds(), never the real clock directly.
+    /// </summary>
+    static void SweepOnce() {
+        {
             lock(devices) {
                 long now = NowTicks();
                 var toRemove = new List<string>();
@@ -1099,7 +1140,6 @@ class Program {
                     devices.Remove(k);
                 }
             }
-            Thread.Sleep(1000);
         }
     }
 
@@ -1232,6 +1272,11 @@ class Program {
                 res.StatusCode = 403;
                 return;
             }
+            // An offline analysis is a fixed result of the capture: clearing it would destroy the only copy.
+            if (isMutatingApi && analysis != null) {
+                res.StatusCode = 409;
+                return;
+            }
 
             if (path.StartsWith("/api/", StringComparison.Ordinal)) res.Headers.Add("Cache-Control", "no-store");
 
@@ -1256,6 +1301,7 @@ class Program {
                 var sb = new StringBuilder();
                 sb.Append("{\"expectedDelayInterval\":").Append(JsonNum(ExpectedDelayInterval));
                 sb.Append(",\"delayAlertThresholdRate\":").Append(JsonNum(DelayAlertThresholdRate)).Append(",");
+                sb.Append("\"analysis\":").Append(AnalysisJson()).Append(",");
                 lock(devices) {
                     sb.Append("\"devices\":["); bool f = true;
                     foreach(var dev in devices.Values) {
@@ -1371,8 +1417,525 @@ class Program {
         }
     }
 
+    // ===================== Offline (pcap / pcapng) analysis =====================
+
+    static ReplayStats analysis = null;               // non-null only in offline mode
+
+    static void PrintUsage() {
+        Console.WriteLine("Usage:");
+        Console.WriteLine("  PTPMonitor.exe                          Live monitoring (choose a NIC)");
+        Console.WriteLine("  PTPMonitor.exe --pcap <file> [--port N]  Analyze a pcap/pcapng capture and show the dashboard");
+        Console.WriteLine("  PTPMonitor.exe --pcap <file> --summary   Print events and a device table, then exit (no dashboard)");
+        Console.WriteLine("Exit codes: 0 ok, 1 capture could not be read, 2 bad arguments.");
+    }
+
+    /// <summary>
+    /// Offline mode: replay a capture through the same parser and periodic evaluation as live monitoring, on a
+    /// virtual clock taken from the capture's timestamps, then either print a summary or serve the (frozen)
+    /// result on the dashboard. No sockets are opened and no log file is written.
+    /// </summary>
+    static int RunOfflineMode(string pcapPath, bool summaryOnly, string portArg) {
+        LoadConfig();
+        Console.WriteLine("=== PTPMonitor v1.14.0 (offline analysis) ===");
+        if (!File.Exists(pcapPath)) { Console.Error.WriteLine("[ERROR] File not found: " + pcapPath); return 1; }
+        if (portArg != null) {
+            int p;
+            if (!(int.TryParse(portArg, NumberStyles.None, CultureInfo.InvariantCulture, out p) && p >= 1 && p <= 65535)) {
+                Console.Error.WriteLine("[ERROR] Invalid --port value: " + portArg); return 2;
+            }
+            WebPort = p.ToString(CultureInfo.InvariantCulture);
+        }
+        consoleLog = summaryOnly;   // summary mode prints each event as it happens; dashboard mode keeps them in memory
+        if (summaryOnly) Console.WriteLine("\n=== Events (capture time) ===");
+        int rc = RunReplay(pcapPath);
+        if (rc != 0) return rc;
+        if (summaryOnly) { PrintSummary(); return 0; }
+
+        if (portArg == null) {
+            Console.Write("Enter Web UI Port [Default: 8080]: ");
+            string pIn = Console.ReadLine();
+            if (!string.IsNullOrEmpty(pIn)) {
+                int parsedPort;
+                if (int.TryParse(pIn, NumberStyles.None, CultureInfo.InvariantCulture, out parsedPort) && parsedPort >= 1 && parsedPort <= 65535) WebPort = parsedPort.ToString(CultureInfo.InvariantCulture);
+                else Console.WriteLine(string.Format("[WARN] Invalid port '{0}', keeping default {1}.", pIn, WebPort));
+            }
+        }
+        Console.WriteLine(string.Format("Analyzed {0} packets ({1} PTP candidates).", analysis.Total, analysis.Fed));
+        consoleLog = true;   // replay is done: from here on messages (e.g. a web server problem) must be visible
+        Task.Factory.StartNew(WebServerLoop, cts.Token, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+        // The dashboard is the whole point of this mode: if it cannot start (e.g. the port is taken) say so and exit,
+        // instead of waiting forever behind an unreachable page.
+        for (int i = 0; i < 60 && !httpListener.IsListening; i++) Thread.Sleep(50);
+        if (!httpListener.IsListening) {
+            Console.Error.WriteLine(string.Format("[ERROR] The dashboard could not be started on port {0} (is the port already in use?). Use --port to choose another, or --summary for text output.", WebPort));
+            return 1;
+        }
+        Console.WriteLine("[INFO] Web Server -> http://localhost:{0}/\n", WebPort);
+        Console.WriteLine("Press Ctrl+C to stop.");
+        Console.CancelKeyPress += (s, e) => {
+            e.Cancel = true;
+            cts.Cancel();
+            try { if (httpListener.IsListening) httpListener.Stop(); httpListener.Close(); } catch (Exception) { /* Best-effort cleanup during shutdown */ }
+            Environment.Exit(0);
+        };
+        while (!cts.Token.IsCancellationRequested) Thread.Sleep(100);
+        return 0;
+    }
+
+    // The capture's time is kept in UTC and converted to local time only for display: adding seconds to an
+    // already-converted local time would drift across a daylight-saving change.
+    static DateTime UnixToUtc(long sec, int nanos) {
+        return new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc).AddSeconds(sec).AddTicks(nanos / 100);
+    }
+
+    static void SetReplayTime(double t, DateTime firstUtc, long baseTicks) {
+        replayTicks = baseTicks + (long)(t * Stopwatch.Frequency);
+        replayWall = firstUtc.AddSeconds(t);   // UTC; WallNow() converts
+    }
+
+    /// <summary>Earliest virtual time (seconds) at which some device becomes due for retention removal.</summary>
+    static bool TryNextRetentionDeadline(long baseTicks, out double deadline) {
+        deadline = 0;
+        if (OfflineRetentionHours <= 0) return false;
+        lock (devices) {
+            long min = long.MaxValue;
+            foreach (var d in devices.Values) if (d.LastSeenTicks < min) min = d.LastSeenTicks;
+            if (min == long.MaxValue) return false;
+            deadline = (double)(min - baseTicks) / Stopwatch.Frequency + OfflineRetentionHours * 3600.0;
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// Moves the virtual clock to t (seconds since the first timestamp), running the periodic evaluation at every
+    /// whole virtual second on the way, exactly as the live once-a-second loop would have. Sweeping second by second
+    /// matters only while some timer can still fire: once OfflineTimeoutSeconds have passed with no traffic, every
+    /// device and instance is offline and every persistence/timeout state is cleared, and the one thing left is
+    /// retention removal. So across a longer gap the sweeps are run one by one for that horizon, then ONE sweep is
+    /// run at each retention deadline (so [LEAVE] keeps its true capture time), then the clock jumps to t.
+    /// </summary>
+    static void ReplayAdvance(ref double curT, ref double nextSweep, double t, DateTime firstUtc, long baseTicks) {
+        double stepUntil = curT + Math.Min(Math.Ceiling(OfflineTimeoutSeconds) + 3.0, 86400.0);
+        while (nextSweep <= t && nextSweep <= stepUntil) {
+            SetReplayTime(nextSweep, firstUtc, baseTicks);
+            SweepOnce();
+            nextSweep += 1.0;
+        }
+        if (nextSweep <= t) {
+            double deadline; int guard = 0;
+            while (guard++ < 100000 && TryNextRetentionDeadline(baseTicks, out deadline)) {
+                double at = Math.Max(Math.Ceiling(deadline), nextSweep);   // stay on the 1 s grid, never go back
+                if (at > t) break;
+                SetReplayTime(at, firstUtc, baseTicks);
+                SweepOnce();
+                nextSweep = at + 1.0;
+            }
+            double last = Math.Floor(t);
+            if (last >= nextSweep) { SetReplayTime(last, firstUtc, baseTicks); SweepOnce(); nextSweep = last + 1.0; }
+        }
+        SetReplayTime(t, firstUtc, baseTicks);
+        curT = t;
+    }
+
+    static int RunReplay(string path) {
+        analysis = new ReplayStats { File = Path.GetFileName(path) };
+        long baseTicks = Stopwatch.Frequency * 3600L;     // arbitrary non-zero origin for the virtual ticks
+        DateTime firstWall = UnixToUtc(0, 0);              // UTC
+        long firstSec = 0; int firstNanos = 0;
+        double curT = 0.0, nextSweep = 1.0;
+        bool started = false;
+        SetReplayTime(0.0, firstWall, baseTicks);          // packets before any timestamp are processed at t = 0
+        try {
+            foreach (var rec in PcapReader.Read(path, analysis.Warnings)) {
+                analysis.Total++;
+                if (rec.HasTime) {
+                    analysis.Timed++;
+                    if (!started) {
+                        started = true; firstSec = rec.Sec; firstNanos = rec.Nanos;
+                        firstWall = UnixToUtc(rec.Sec, rec.Nanos);
+                        analysis.First = firstWall.ToLocalTime(); analysis.HasRange = true;
+                        SetReplayTime(0.0, firstWall, baseTicks);
+                    }
+                    double t = (double)(rec.Sec - firstSec) + (double)(rec.Nanos - firstNanos) / 1e9;
+                    // Out-of-order timestamps never move the clock backwards: the latest time seen wins.
+                    if (t > curT) ReplayAdvance(ref curT, ref nextSweep, t, firstWall, baseTicks);
+                    analysis.Last = firstWall.AddSeconds(curT).ToLocalTime();
+                }
+                string src, skip; byte[] payload; int port;
+                if (!PcapReader.TryExtractUdp(rec.Data, rec.LinkType, out src, out payload, out port, out skip)) { analysis.Skip(skip); continue; }
+                analysis.Fed++;
+                try { ParsePacket(src, payload, payload.Length, port); }
+                catch (Exception ex) { analysis.Skip("parser error (" + ex.GetType().Name + ")"); }
+            }
+        } catch (CaptureFormatException ex) {
+            Console.Error.WriteLine("[ERROR] " + ex.Message); return 1;
+        } catch (IOException ex) {
+            Console.Error.WriteLine("[ERROR] Cannot read the capture: " + ex.Message); return 1;
+        } catch (UnauthorizedAccessException ex) {
+            Console.Error.WriteLine("[ERROR] Cannot read the capture: " + ex.Message); return 1;
+        }
+        SweepOnce();   // evaluate the state at the very end of the capture; the clock then stays frozen there
+        if (analysis.Total > 0 && analysis.Timed == 0) analysis.Warnings.Add("The capture carries no timestamps (e.g. only pcapng Simple Packet Blocks), so timer-based diagnoses (offline, persistence, Announce timeout) cannot be evaluated.");
+        return 0;
+    }
+
+    static void PrintSummary() {
+        var a = analysis;
+        Console.WriteLine("\n=== Capture ===");
+        Console.WriteLine("File: " + a.File);
+        if (a.HasRange) Console.WriteLine(string.Format("Time: {0:yyyy-MM-dd HH:mm:ss} .. {1:yyyy-MM-dd HH:mm:ss}", a.First, a.Last));
+        Console.WriteLine(string.Format("Packets read: {0}; PTP candidates (UDP 319/320) fed to the parser: {1}", a.Total, a.Fed));
+        foreach (var kv in a.Skipped) Console.WriteLine(string.Format("  skipped: {0} x {1}", kv.Value, kv.Key));
+        foreach (var w in a.Warnings) Console.WriteLine("[WARN] " + w);
+        Console.WriteLine("\n=== Devices ===");
+        lock (devices) {
+            foreach (var dev in devices.Values.OrderBy(d => d.IP, StringComparer.Ordinal)) {
+                Console.WriteLine(string.Format("{0}  MAC {1}  {2}  {3}", dev.IP, dev.Mac, GetVendorSafe(dev.Mac), dev.IsOnline ? "online" : "offline"));
+                foreach (var ps in dev.Protocols.Values.OrderBy(p => p.Version + p.Domain, StringComparer.Ordinal)) {
+                    var sbp = new StringBuilder();
+                    sbp.Append(string.Format("    {0} domain {1}: {2}{3}", ps.Version, ps.Domain, ps.Role, ps.IsOnline ? "" : " (offline)"));
+                    if (!string.IsNullOrEmpty(ps.GrandmasterId)) sbp.Append(" GM=" + ps.GrandmasterId + (ps.GmVerified ? "" : "?"));
+                    string mech = DelayMech(ps); if (mech.Length > 0) sbp.Append(" delay=" + mech);
+                    if (ps.IsConflict) sbp.Append(" [CONFLICT]");
+                    if (ps.MechMismatch) sbp.Append(" [DELAY MIX]");
+                    if (ps.AnnounceStale) sbp.Append(" [NO ANNOUNCE]");
+                    if (ps.IntervalMismatch) sbp.Append(" [INTERVAL]");
+                    Console.WriteLine(sbp.ToString());
+                }
+            }
+        }
+    }
+
+    static string AnalysisJson() {
+        var a = analysis;
+        if (a == null) return "null";
+        var sb = new StringBuilder();
+        sb.Append("{\"file\":").Append(JsonStr(a.File));
+        sb.Append(",\"first\":").Append(JsonStr(a.HasRange ? a.First.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) : ""));
+        sb.Append(",\"last\":").Append(JsonStr(a.HasRange ? a.Last.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture) : ""));
+        sb.Append(",\"packets\":").Append(a.Total.ToString(CultureInfo.InvariantCulture));
+        sb.Append(",\"fed\":").Append(a.Fed.ToString(CultureInfo.InvariantCulture));
+        sb.Append(",\"timed\":").Append(a.Timed.ToString(CultureInfo.InvariantCulture));
+        sb.Append(",\"skipped\":[");
+        bool first = true;
+        foreach (var kv in a.Skipped) {
+            if (!first) sb.Append(","); first = false;
+            sb.Append("{\"reason\":").Append(JsonStr(kv.Key)).Append(",\"count\":").Append(kv.Value.ToString(CultureInfo.InvariantCulture)).Append("}");
+        }
+        sb.Append("],\"warnings\":[");
+        for (int i = 0; i < a.Warnings.Count; i++) { if (i > 0) sb.Append(","); sb.Append(JsonStr(a.Warnings[i])); }
+        sb.Append("]}");
+        return sb.ToString();
+    }
+
     static readonly string HtmlContent =
         LoadEmbeddedResource("PTPMonitor.web.index.html")
             .Replace("__STYLE_PLACEHOLDER__", LoadEmbeddedResource("PTPMonitor.web.style.css"))
             .Replace("__SCRIPT_PLACEHOLDER__", LoadEmbeddedResource("PTPMonitor.web.app.js"));
+}
+
+/// <summary>One packet read from a capture file.</summary>
+class CaptureRecord {
+    public bool HasTime;
+    public long Sec;        // Unix seconds (valid when HasTime)
+    public int Nanos;       // 0..999999999
+    public int LinkType;    // LINKTYPE_* of the interface the packet was captured on
+    public byte[] Data;
+}
+
+/// <summary>The capture file cannot be interpreted at all (as opposed to merely being truncated).</summary>
+class CaptureFormatException : Exception {
+    public CaptureFormatException(string message) : base(message) { }
+}
+
+/// <summary>What the offline analysis saw, for the dashboard banner and the --summary output.</summary>
+class ReplayStats {
+    public string File;
+    public long Total, Fed, Timed;
+    public bool HasRange;
+    public DateTime First, Last;
+    public SortedDictionary<string, long> Skipped = new SortedDictionary<string, long>(StringComparer.Ordinal);
+    public List<string> Warnings = new List<string>();
+
+    /// <summary>Counts a packet that was not handed to the PTP parser, by reason. The number of distinct
+    /// reasons is capped so a hostile file cannot grow this without bound.</summary>
+    public void Skip(string reason) {
+        if (!Skipped.ContainsKey(reason) && Skipped.Count >= 32) reason = "other";
+        long n; Skipped.TryGetValue(reason, out n);
+        Skipped[reason] = n + 1;
+    }
+}
+
+/// <summary>
+/// Reads classic pcap (microsecond and nanosecond, either byte order) and pcapng captures as a stream, and
+/// extracts UDP payloads from Ethernet / raw-IP frames. The capture is treated as UNTRUSTED input: every length
+/// is bounds-checked, nothing larger than the limits below is buffered, a damaged or truncated file yields what
+/// could be read plus a warning, and the file is only ever opened read-only.
+/// Formats follow the libpcap savefile man page and the pcapng specification (draft-ietf-opsawg-pcapng).
+/// LINKTYPE values (tcpdump.org/linktypes.html): 1 Ethernet, 101 raw IP, 228 raw IPv4. Linux cooked (SLL/SLL2)
+/// is NOT supported, since its header layout was not confirmed against a primary source.
+/// </summary>
+static class PcapReader {
+    public const int MaxPacketBytes = 262144;       // largest captured packet we accept
+    const int MaxBlockBytes = 1 << 20;              // largest pcapng block we buffer (packet, interface, section header)
+    const int MaxInterfaces = 1024;
+    // Timestamps at or beyond the year 3000 are treated as "no timestamp": no real capture has them, and staying
+    // well clear of DateTime's own limit (year 9999) keeps every conversion and addition on the virtual clock safe.
+    const long MaxUnixSeconds = 32503679999L;       // 2999-12-31T23:59:59Z
+
+    class IfaceInfo {
+        public int LinkType;
+        public uint SnapLen;
+        public bool TsPow2;      // if_tsresol MSB set: resolution is 2^-n; otherwise 10^-n
+        public int TsExp = 6;    // default resolution 10^-6 when if_tsresol is absent
+        public long TsOffset;    // if_tsoffset (seconds), default 0
+    }
+
+    static bool ReadExact(Stream s, byte[] buf, int offset, int count) {
+        int got = 0;
+        while (got < count) {
+            int n = s.Read(buf, offset + got, count - got);
+            if (n <= 0) return false;
+            got += n;
+        }
+        return true;
+    }
+    static uint U32(byte[] b, int o, bool be) {
+        return be ? (uint)((b[o] << 24) | (b[o + 1] << 16) | (b[o + 2] << 8) | b[o + 3])
+                  : (uint)(b[o] | (b[o + 1] << 8) | (b[o + 2] << 16) | (b[o + 3] << 24));
+    }
+    static int U16(byte[] b, int o, bool be) {
+        return be ? ((b[o] << 8) | b[o + 1]) : (b[o] | (b[o + 1] << 8));
+    }
+    static void Warn(List<string> warnings, HashSet<string> seen, string msg) {
+        if (seen.Add(msg)) warnings.Add(msg);
+    }
+
+    public static IEnumerable<CaptureRecord> Read(string path, List<string> warnings) {
+        using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read)) {
+            var head = new byte[4];
+            if (!ReadExact(fs, head, 0, 4)) throw new CaptureFormatException("The file is empty or too short to be a capture.");
+            if (head[0] == 0x1F && head[1] == 0x8B) throw new CaptureFormatException("Compressed (gzip) captures are not supported; decompress the file first.");
+            uint magic = U32(head, 0, false);
+            if (magic == 0x0A0D0D0A) {
+                foreach (var r in ReadPcapng(fs, warnings)) yield return r;
+                yield break;
+            }
+            bool be, nano;
+            if (magic == 0xA1B2C3D4) { be = false; nano = false; }
+            else if (magic == 0xD4C3B2A1) { be = true; nano = false; }
+            else if (magic == 0xA1B23C4D) { be = false; nano = true; }
+            else if (magic == 0x4D3CB2A1) { be = true; nano = true; }
+            else throw new CaptureFormatException("Unrecognized capture format (neither pcap nor pcapng).");
+            foreach (var r in ReadPcap(fs, be, nano, warnings)) yield return r;
+        }
+    }
+
+    static IEnumerable<CaptureRecord> ReadPcap(Stream fs, bool be, bool nano, List<string> warnings) {
+        var rest = new byte[20];   // global header after the 4-byte magic: major 2, minor 2, reserved 4+4, snaplen 4, network 4
+        if (!ReadExact(fs, rest, 0, 20)) throw new CaptureFormatException("The pcap global header is truncated.");
+        if (U16(rest, 0, be) != 2) throw new CaptureFormatException("Unsupported pcap version " + U16(rest, 0, be) + "." + U16(rest, 2, be) + " (only 2.x is supported).");
+        int linkType = (int)(U32(rest, 16, be) & 0xFFFF);   // the link-layer type is the low 16 bits
+        var hdr = new byte[16];
+        long index = 0;
+        while (true) {
+            int first = fs.ReadByte();
+            if (first < 0) yield break;                       // clean end of file
+            hdr[0] = (byte)first;
+            if (!ReadExact(fs, hdr, 1, 15)) { warnings.Add("The capture ends inside a record header; the rest was ignored."); yield break; }
+            long sec = U32(hdr, 0, be);
+            long frac = U32(hdr, 4, be);
+            uint incl = U32(hdr, 8, be);
+            if (incl > MaxPacketBytes) {
+                warnings.Add(string.Format("Record {0} claims {1} captured bytes (limit {2}); the file looks corrupt, so reading stopped here.", index + 1, incl, MaxPacketBytes));
+                yield break;
+            }
+            var data = new byte[incl];
+            if (!ReadExact(fs, data, 0, (int)incl)) { warnings.Add("The capture ends inside a packet; the partial packet was ignored."); yield break; }
+            long nanos = nano ? frac : frac * 1000L;
+            if (nanos >= 1000000000L) { sec += nanos / 1000000000L; nanos %= 1000000000L; }
+            index++;
+            yield return new CaptureRecord { HasTime = sec <= MaxUnixSeconds, Sec = sec, Nanos = (int)nanos, LinkType = linkType, Data = data };
+        }
+    }
+
+    static bool Timestamp(ulong ts, IfaceInfo info, out long sec, out int nanos) {
+        sec = 0; nanos = 0;
+        ulong s;
+        if (!info.TsPow2) {
+            if (info.TsExp > 18) return false;
+            ulong unit = 1; for (int i = 0; i < info.TsExp; i++) unit *= 10;
+            s = ts / unit; ulong rem = ts % unit;
+            if (info.TsExp <= 9) nanos = (int)(rem * (1000000000UL / unit));
+            else nanos = (int)(rem / (unit / 1000000000UL));
+        } else {
+            if (info.TsExp > 63) return false;
+            s = ts >> info.TsExp;
+            ulong mask = info.TsExp == 0 ? 0UL : ((1UL << info.TsExp) - 1UL);
+            nanos = (int)((double)(ts & mask) * 1e9 / Math.Pow(2.0, info.TsExp));
+            if (nanos > 999999999) nanos = 999999999;
+        }
+        if (s > (ulong)MaxUnixSeconds) return false;
+        long total = (long)s + info.TsOffset;
+        if (total < 0 || total > MaxUnixSeconds) return false;
+        sec = total;
+        return true;
+    }
+
+    static IEnumerable<CaptureRecord> ReadPcapng(Stream fs, List<string> warnings) {
+        fs.Seek(0, SeekOrigin.Begin);
+        bool be = false, firstSection = true;
+        var ifaces = new List<IfaceInfo>();
+        var seen = new HashSet<string>();
+        var h8 = new byte[8];
+        var tail = new byte[4];
+        while (true) {
+            int b0 = fs.ReadByte();
+            if (b0 < 0) yield break;
+            h8[0] = (byte)b0;
+            if (!ReadExact(fs, h8, 1, 7)) { warnings.Add("The capture ends inside a block header; the rest was ignored."); yield break; }
+
+            if (h8[0] == 0x0A && h8[1] == 0x0D && h8[2] == 0x0D && h8[3] == 0x0A) {      // Section Header Block
+                var bom = new byte[4];
+                if (!ReadExact(fs, bom, 0, 4)) { warnings.Add("The capture ends inside a section header; the rest was ignored."); yield break; }
+                uint bomLe = U32(bom, 0, false);
+                if (bomLe == 0x1A2B3C4D) be = false;
+                else if (bomLe == 0x4D3C2B1A) be = true;
+                else throw new CaptureFormatException("A pcapng section header has an invalid byte-order magic.");
+                uint shbTotal = U32(h8, 4, be);
+                if (shbTotal < 28 || shbTotal % 4 != 0 || shbTotal > MaxBlockBytes) { warnings.Add("A pcapng section header has an invalid length; reading stopped here."); yield break; }
+                var shbRest = new byte[shbTotal - 12];     // everything after the 4+4+4 bytes read so far (type, length, byte-order magic), incl. the trailing length
+                if (!ReadExact(fs, shbRest, 0, shbRest.Length)) { warnings.Add("The capture ends inside a section header; the rest was ignored."); yield break; }
+                // The section must be well-formed and of the one version this reader understands (1.x); a section
+                // we cannot trust ends the read (an unusable FIRST section means the file itself is unusable).
+                string shbProblem = null;
+                if (U16(shbRest, 0, be) != 1) shbProblem = "unsupported pcapng version " + U16(shbRest, 0, be) + "." + U16(shbRest, 2, be) + " (only 1.x is supported)";
+                else if (U32(shbRest, shbRest.Length - 4, be) != shbTotal) shbProblem = "a pcapng section header's trailing length does not match; the file looks corrupt";
+                if (shbProblem != null) {
+                    if (firstSection) throw new CaptureFormatException("The " + shbProblem + ".");
+                    warnings.Add("A later " + shbProblem + "; reading stopped here.");
+                    yield break;
+                }
+                firstSection = false;
+                ifaces.Clear();                            // interface IDs restart in each section
+                continue;
+            }
+
+            uint type = U32(h8, 0, be);
+            uint total = U32(h8, 4, be);
+            if (total < 12 || total % 4 != 0) { warnings.Add("A pcapng block has an invalid length; the file looks corrupt, so reading stopped here."); yield break; }
+            bool needBody = type == 1 || type == 3 || type == 6;   // interface description, simple packet, enhanced packet
+            if (!needBody) {                                       // unknown or irrelevant block: skip it (incl. its trailing length)
+                long skip = (long)total - 8;
+                if (fs.Position + skip > fs.Length) { warnings.Add("The capture ends inside a block; the rest was ignored."); yield break; }
+                fs.Seek(skip, SeekOrigin.Current);
+                continue;
+            }
+            if (total > MaxBlockBytes) { warnings.Add(string.Format("A pcapng block of {0} bytes exceeds the limit ({1}); the file looks corrupt, so reading stopped here.", total, MaxBlockBytes)); yield break; }
+            var body = new byte[total - 12];
+            if (!ReadExact(fs, body, 0, body.Length) || !ReadExact(fs, tail, 0, 4)) { warnings.Add("The capture ends inside a block; the rest was ignored."); yield break; }
+            if (U32(tail, 0, be) != total) { warnings.Add("A pcapng block's trailing length does not match; the file looks corrupt, so reading stopped here."); yield break; }
+
+            if (type == 1) {                                       // Interface Description Block
+                if (body.Length < 8) { Warn(warnings, seen, "An interface description block is too short and was ignored."); continue; }
+                if (ifaces.Count >= MaxInterfaces) { warnings.Add("More than " + MaxInterfaces + " interfaces; reading stopped here."); yield break; }
+                var info = new IfaceInfo { LinkType = U16(body, 0, be), SnapLen = U32(body, 4, be) };
+                int o = 8;
+                while (o + 4 <= body.Length) {                     // options: code 2, length 2, value padded to 4
+                    int code = U16(body, o, be), len = U16(body, o + 2, be);
+                    o += 4;
+                    if (code == 0 || o + len > body.Length) break;
+                    if (code == 9 && len >= 1) { info.TsPow2 = (body[o] & 0x80) != 0; info.TsExp = body[o] & 0x7F; }                      // if_tsresol
+                    else if (code == 14 && len >= 8) {                                                                                   // if_tsoffset
+                        ulong v = be ? (((ulong)U32(body, o, true) << 32) | U32(body, o + 4, true)) : (((ulong)U32(body, o + 4, false) << 32) | U32(body, o, false));
+                        info.TsOffset = unchecked((long)v);
+                    }
+                    o += (len + 3) & ~3;
+                }
+                ifaces.Add(info);
+            } else if (type == 6) {                                // Enhanced Packet Block
+                if (body.Length < 20) { Warn(warnings, seen, "An enhanced packet block is too short and was ignored."); continue; }
+                uint ifid = U32(body, 0, be);
+                uint cap = U32(body, 12, be);
+                if (ifid >= ifaces.Count) { Warn(warnings, seen, "Packets referring to an unknown interface were ignored."); continue; }
+                if (cap > MaxPacketBytes || cap > body.Length - 20) { Warn(warnings, seen, "Packets with an invalid captured length were ignored."); continue; }
+                var info = ifaces[(int)ifid];
+                var data = new byte[cap];
+                Array.Copy(body, 20, data, 0, (int)cap);
+                long sec; int nanos;
+                bool ok = Timestamp(((ulong)U32(body, 4, be) << 32) | U32(body, 8, be), info, out sec, out nanos);
+                yield return new CaptureRecord { HasTime = ok, Sec = sec, Nanos = nanos, LinkType = info.LinkType, Data = data };
+            } else {                                               // Simple Packet Block: no timestamp, first interface
+                if (ifaces.Count == 0 || body.Length < 4) { Warn(warnings, seen, "A simple packet block without an interface was ignored."); continue; }
+                var info = ifaces[0];
+                long cap = Math.Min((long)U32(body, 0, be), (long)(body.Length - 4));
+                if (info.SnapLen > 0) cap = Math.Min(cap, (long)info.SnapLen);
+                if (cap > MaxPacketBytes) cap = MaxPacketBytes;
+                var data = new byte[cap];
+                Array.Copy(body, 4, data, 0, (int)cap);
+                yield return new CaptureRecord { HasTime = false, LinkType = info.LinkType, Data = data };
+            }
+        }
+    }
+
+    /// <summary>
+    /// Extracts the UDP payload of an IPv4 packet addressed to the PTP ports (319/320) from a captured frame.
+    /// Returns false with a short reason (used to count what was skipped) for anything else: other link types,
+    /// IPv6, Layer-2 PTP (EtherType 0x88F7), fragments, non-UDP, other ports, or damaged headers. Datagrams over
+    /// 2048 bytes are dropped exactly as the live receiver (2048-byte buffer) drops them.
+    /// </summary>
+    public static bool TryExtractUdp(byte[] d, int linkType, out string srcIp, out byte[] payload, out int dstPort, out string skip) {
+        srcIp = null; payload = null; dstPort = 0; skip = null;
+        int ip;
+        if (linkType == 1) {                                       // Ethernet (+ up to two VLAN tags)
+            if (d.Length < 14) { skip = "truncated Ethernet frame"; return false; }
+            int off = 12, etype = (d[off] << 8) | d[off + 1], tags = 0;
+            while ((etype == 0x8100 || etype == 0x88A8) && tags < 2) {
+                if (d.Length < off + 6) { skip = "truncated VLAN tag"; return false; }
+                off += 4; etype = (d[off] << 8) | d[off + 1]; tags++;
+            }
+            if (etype == 0x8100 || etype == 0x88A8) { skip = "more than two VLAN tags"; return false; }
+            if (etype == 0x86DD) { skip = "IPv6"; return false; }
+            if (etype == 0x88F7) { skip = "Layer-2 PTP (EtherType 0x88F7), not supported"; return false; }
+            if (etype != 0x0800) { skip = "non-IP frame"; return false; }
+            ip = off + 2;
+        } else if (linkType == 101) {                              // raw IP: the version nibble says which
+            if (d.Length < 1) { skip = "empty packet"; return false; }
+            int v = d[0] >> 4;
+            if (v == 6) { skip = "IPv6"; return false; }
+            if (v != 4) { skip = "unrecognized raw IP packet"; return false; }
+            ip = 0;
+        } else if (linkType == 228) {                              // raw IPv4
+            ip = 0;
+        } else { skip = "unsupported link type " + linkType; return false; }
+
+        if (d.Length < ip + 20) { skip = "truncated IPv4 header"; return false; }
+        if ((d[ip] >> 4) != 4) { skip = "not IPv4"; return false; }
+        int ihl = (d[ip] & 0x0F) * 4;
+        if (ihl < 20 || d.Length < ip + ihl) { skip = "invalid IPv4 header length"; return false; }
+        int totalLen = (d[ip + 2] << 8) | d[ip + 3];
+        if (totalLen < ihl) { skip = "invalid IPv4 total length"; return false; }
+        if (d[ip + 9] != 17) { skip = "not UDP"; return false; }
+        int frag = (d[ip + 6] << 8) | d[ip + 7];
+        if ((frag & 0x2000) != 0 || (frag & 0x1FFF) != 0) { skip = "IPv4 fragment"; return false; }
+        int ipEnd = Math.Min(d.Length, ip + totalLen);             // drops Ethernet padding; a snap-truncated capture ends earlier
+        int udp = ip + ihl;
+        if (ipEnd < udp + 8) { skip = "truncated UDP header"; return false; }
+        dstPort = (d[udp + 2] << 8) | d[udp + 3];
+        int udpLen = (d[udp + 4] << 8) | d[udp + 5];
+        if (udpLen < 8) { skip = "invalid UDP length"; return false; }
+        if (dstPort != 319 && dstPort != 320) { skip = "UDP, other port"; return false; }
+        // The datagram must fit inside the IPv4 packet that carries it; a UDP length larger than that is not a valid
+        // datagram (a real receiver never delivers it), so it is not analyzed as one.
+        if (udp + udpLen > ip + totalLen) { skip = "invalid UDP length"; return false; }
+        if (udpLen - 8 > 2048) { skip = "UDP payload over 2048 bytes"; return false; }
+        // A snaplen-truncated capture holds only part of the datagram. The live receiver would have seen all of it,
+        // so analyzing the fragment could give a different answer (length gates would fail); report it instead.
+        if (udp + udpLen > d.Length) { skip = "capture truncated (snaplen)"; return false; }
+        int plen = udpLen - 8;
+        payload = new byte[plen];
+        Array.Copy(d, udp + 8, payload, 0, plen);
+        srcIp = d[ip + 12] + "." + d[ip + 13] + "." + d[ip + 14] + "." + d[ip + 15];
+        return true;
+    }
 }

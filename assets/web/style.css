@@ -37,5 +37,6 @@ button:hover{border-color:var(--accent);}
 .unconfirmed-note{opacity:0.5;font-size:0.7em;margin-left:4px;}
 .node.mech-warn:not(.conflict){border:1px solid #ffcc00;}
 .alert-item.warn{color:#ffcc00;}
+.profile-hint{font-weight:normal;font-size:0.75rem;color:#aaa;opacity:0.8;}
 .gm-history{margin-bottom:0.8rem;font-size:0.8rem;color:#aaa;}
 .gm-history summary{cursor:pointer;color:#ffcc00;}

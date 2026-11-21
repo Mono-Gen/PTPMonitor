@@ -18,6 +18,10 @@ Run `PTPMonitor.exe` (requires proper configuration in `config.ini`).
 
 ## Changelog
 
+### [v1.13.0] - 2026-11-21
+#### Added
+- **Profile hint on domain headings**: a small `hint:` next to the domain number when it matches a profile default/range documented by vendors or standards bodies: PTPv2 domain 127 (SMPTE ST 2059-2 default), 0 (AES67 default, also used by others), 24–43 / 44–63 (ITU-T G.8275.1 / G.8275.2 range); PTPv1 is noted as Dante's default clocking. It is a hint from the number alone, not a detection: no alert, and nothing is shown for other numbers. The IEEE 1588 default profile's default domain and Dante's PTPv1 subdomain names could not be confirmed, so they are not interpreted. Display only (`app.js`); no backend change.
+
 ### [v1.12.0] - 2026-11-21
 #### Added
 - **Announce timeout warning**: a PTPv2 Leader that is still active (e.g. still sending Sync, so the offline timeout cannot fire) but has sent no Announce for `AnnounceReceiptTimeout` × its own Announce interval gets a `NO ANNOUNCE` badge, an alert-banner entry and one `[ANNOUNCE_TIMEOUT]` log per episode (`/api/data` → `announceStale`). A 1 s floor avoids false alarms for sub-second intervals; Leaders whose Announce carries no interval (0x7F) are never judged.

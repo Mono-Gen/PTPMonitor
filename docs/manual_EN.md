@@ -1,4 +1,4 @@
-# PTPMonitor User Manual (v1.12.0)
+# PTPMonitor User Manual (v1.13.0)
 
 PTPMonitor is a specialized protocol analyzer designed to capture PTP (Precision Time Protocol) v1 / v2 traffic, visualize device status, Boundary Clock (BC) operations, and network topology for high-precision diagnostic purposes.
 
@@ -68,6 +68,16 @@ Both are **warnings** (yellow badge, alert-banner entry, one log line per episod
 
 > [!NOTE]
 > With a long Announce interval (e.g. 16 s) the limit is 3 × 16 = 48 s. If the Leader stops all role-defining traffic (Sync, Announce, ...) it is shown as offline after the offline timeout, long before that; if it keeps sending Sync, it is reported once 48 s pass without an Announce.
+
+### 10. Profile Hint on Domain Headings
+Each domain heading may carry a small `hint:` showing which PTP profile the domain **number** matches. It is a hint, not a detection result: the domain number is set by the user and several profiles share defaults (0 in particular), so nothing is concluded and no alert is raised.
+- PTPv2 domain `127`: SMPTE ST 2059-2 default domain
+- PTPv2 domain `0`: AES67 default domain (also used by other profiles)
+- PTPv2 domain `24`–`43` / `44`–`63`: within the ITU-T G.8275.1 / G.8275.2 range
+- PTPv1: noted as Dante's default clocking (subdomain names are not interpreted)
+- Any other number: no hint.
+
+The values come from vendor and standards-body documentation, not from the standards' full text. The IEEE 1588 default profile's default domain and Dante's PTPv1 subdomain names could not be confirmed, so they are deliberately not shown.
 
 ## WebUI Operations
 - **Uptime / Offline**: Real-time display of uptime for active devices or elapsed time since disconnection for offline devices. Uptime resets (and a `[REJOIN]` log entry is added) when a device comes back online after being offline.

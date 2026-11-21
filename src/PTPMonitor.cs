@@ -22,6 +22,10 @@ class ProtocolState {
     public string Role { get; set; }
     public string OwnId { get; set; }
     public string GrandmasterId { get; set; }
+    // true only when GrandmasterId was actually read from the wire (v2 Announce / v1 Sync body).
+    // A Leader's GrandmasterId is otherwise provisionally set to its own ID for display; that guess
+    // must not take part in conflict detection, since a Boundary Clock's own ID is not "a GM".
+    public bool GmVerified { get; set; }
     public int? SyncLog { get; set; }
     public int? AnnounceLog { get; set; }
 
@@ -104,6 +108,28 @@ class TopologyLink {
 }
 
 /// <summary>
+/// One observed Grandmaster change within a (version, domain), kept for display in the dashboard.
+/// </summary>
+class GmChangeEvent {
+    public string Time { get; set; }
+    public string OldGm { get; set; }
+    public string NewGm { get; set; }
+}
+
+/// <summary>
+/// Per-(version, domain) record of the Grandmaster the domain's online Leaders last agreed on,
+/// plus the recent history of changes of that agreed GM. Tracked per domain (not per reporting
+/// device) so a handover to a device that was never a GM before is still recorded, and a GM plus
+/// the Boundary Clocks below it (all reporting the same GM) collapse into one change.
+/// </summary>
+class DomainGmState {
+    public string Gm { get; set; }
+    public long LastSeenTicks { get; set; }
+    public List<GmChangeEvent> Events { get; set; }
+    public DomainGmState() { Events = new List<GmChangeEvent>(); }
+}
+
+/// <summary>
 /// Main program class for PTPMonitor.
 /// Controls packet capture, monitoring loops, and the web server.
 /// </summary>
@@ -126,6 +152,9 @@ class Program {
     // this forces periodic re-confirmation via a fresh Delay_Resp. Not a readonly const so tests can
     // shrink it (see ConflictPersistThresholdSeconds for the same pattern).
     static double LinkStaleAfterSeconds = 300.0;
+    static int MaxGmHistoryDomains = 64;            // Cap domains tracked for GM history: domain values come from packets and could be spoofed
+    static int MaxGmHistoryPerDomain = 20;          // Recent GM changes kept per (version, domain). Not readonly so tests can shrink it.
+    static bool gmHistoryLimitWarned = false;
     static bool deviceLimitWarned = false;
     static bool protocolStateLimitWarned = false;
 
@@ -136,6 +165,8 @@ class Program {
 
     static Dictionary<string, DeviceInfo> devices = new Dictionary<string, DeviceInfo>();
     static Dictionary<string, TopologyLink> topologyLinks = new Dictionary<string, TopologyLink>();
+    // Guarded by lock(devices), like devices/topologyLinks.
+    static Dictionary<string, DomainGmState> domainGms = new Dictionary<string, DomainGmState>();
     static CancellationTokenSource cts = new CancellationTokenSource();
     static StreamWriter logWriter = null;
     static string currentLogPath = "ptp_monitor.log";
@@ -180,7 +211,7 @@ class Program {
     /// </summary>
     static void Main(string[] args) {
         LoadConfig();
-        Console.WriteLine("=== PTPMonitor v1.8.1 ===");
+        Console.WriteLine("=== PTPMonitor v1.9.0 ===");
 
         NetworkInterface[] nics = NetworkInterface.GetAllNetworkInterfaces();
         List<IPAddress> validIps = new List<IPAddress>();
@@ -437,6 +468,47 @@ class Program {
     }
 
     /// <summary>
+    /// Feeds one (version, domain)'s current Grandmaster into the history. Called once per
+    /// MonitorLoop sweep with singleGm = the one verified GM ID all of the domain's online Leaders
+    /// agree on, or null when there is none or several (a conflict is in progress: neither is a
+    /// "settled" GM, so nothing is recorded and the last settled GM is kept for comparison).
+    /// A change is recorded when the settled GM differs from the previously settled one, regardless
+    /// of which device reports it. When the table is full a new domain may only take the slot of one
+    /// that was NOT refreshed in this same sweep (LastSeenTicks &lt; now), so spoofed/abandoned
+    /// domains cannot hold slots forever, while domains that are active right now are never evicted:
+    /// otherwise, with more active domains than slots, they would keep evicting each other and
+    /// wipe each other's history every second. If every slot is active the newcomer is skipped.
+    /// Callers must refresh existing domains before offering new ones within one sweep.
+    /// Must hold lock(devices).
+    /// </summary>
+    static void TrackDomainGm(string version, string domain, string singleGm, long now) {
+        string key = StateKey(version, domain);
+        DomainGmState st;
+        if (!domainGms.TryGetValue(key, out st)) {
+            if (singleGm == null) return;
+            if (domainGms.Count >= MaxGmHistoryDomains) {
+                if (!gmHistoryLimitWarned) {
+                    gmHistoryLimitWarned = true;
+                    Log(string.Format("[WARN] GM-history domain limit ({0}) reached; inactive domains are evicted for new ones, and new domains are skipped while all tracked domains are active.", MaxGmHistoryDomains));
+                }
+                string oldestKey = null; long oldestTicks = long.MaxValue;
+                foreach (var kv in domainGms) {
+                    if (kv.Value.LastSeenTicks < now && kv.Value.LastSeenTicks < oldestTicks) { oldestTicks = kv.Value.LastSeenTicks; oldestKey = kv.Key; }
+                }
+                if (oldestKey == null) return; // all tracked domains are active this sweep
+                domainGms.Remove(oldestKey);
+            }
+            domainGms[key] = new DomainGmState { Gm = singleGm, LastSeenTicks = now };
+            return;
+        }
+        st.LastSeenTicks = now;
+        if (singleGm == null || singleGm == st.Gm) return;
+        st.Events.Add(new GmChangeEvent { Time = DateTime.Now.ToString("HH:mm:ss", CultureInfo.InvariantCulture), OldGm = st.Gm, NewGm = singleGm });
+        if (st.Events.Count > MaxGmHistoryPerDomain) st.Events.RemoveAt(0);
+        st.Gm = singleGm;
+    }
+
+    /// <summary>
     /// Finds an online Leader for (version, domain) to use as a display-only "best guess" parent
     /// when no Delay_Resp-confirmed link exists yet. Never cached: recomputed on every read so a
     /// bad guess (e.g. picked while two Leaders briefly coexisted) can't outlive the situation that
@@ -566,13 +638,22 @@ class Program {
             }
             var pState = dev.Protocols[stateKey];
             string oldRole = pState.Role;
+            // A different source clock identity behind the same IP (device swapped/re-IDed): whatever
+            // GM was verified for the previous identity says nothing about this one.
+            if (pState.OwnId != null && pState.OwnId != ownId) pState.GmVerified = false;
             pState.OwnId = ownId;
             pState.LastSeenTicks = now;
             // IsOnline is only (re)asserted alongside a role-defining packet, not on every packet:
             // otherwise non-role traffic (Management/Signaling/Pdelay) would keep re-flipping IsOnline
             // back to true right after MonitorLoop ages it out via LastRoleSeenTicks, defeating that
             // staleness check entirely (a stale Role must actually go offline, not just "flicker").
-            if (role != "Unknown") { pState.Role = role; pState.LastRoleSeenTicks = now; pState.IsOnline = true; }
+            if (role != "Unknown") {
+                // If this instance already outlived the offline timeout, its verified GM is stale even if
+                // MonitorLoop has not run since (it only sweeps once per second): drop it BEFORE the
+                // timestamp below is refreshed, or a returning Sync-only packet would keep it alive.
+                if (ElapsedSeconds(pState.LastRoleSeenTicks) >= OfflineTimeoutSeconds) pState.GmVerified = false;
+                pState.Role = role; pState.LastRoleSeenTicks = now; pState.IsOnline = true;
+            }
 
             if (protoVer == "v2") {
                 sbyte logInt = unchecked((sbyte)data[33]); // v2 header: logMessageInterval
@@ -587,8 +668,13 @@ class Program {
                 }
                 if (len >= 60) {
                     string v1GmId = BitConverter.ToString(data, 54, 6).Replace("-",""); // grandmasterClockUuid (offset 54)
-                    if (pState.GrandmasterId != null && pState.GrandmasterId != v1GmId) Log(string.Format("[GM_CHANGE] {0} v1 GM -> {1}", ip, v1GmId));
+                    // Only a previously wire-verified GM counts as a "change"; the provisional self-ID
+                    // a Leader gets before its first GM report is not a real earlier GM.
+                    if (pState.GmVerified && pState.GrandmasterId != v1GmId) {
+                        Log(string.Format("[GM_CHANGE] {0} v1 GM {1} -> {2}", ip, pState.GrandmasterId, v1GmId));
+                    }
                     pState.GrandmasterId = v1GmId;
+                    pState.GmVerified = true;
                 }
             }
 
@@ -622,13 +708,16 @@ class Program {
             if (protoVer == "v2" && msgType == 11 && len >= 61) {
                 pState.GmPriority1 = data[47]; pState.GmClass = data[48]; pState.GmPriority2 = data[52];
                 string gmId = BitConverter.ToString(data, 53, 8).Replace("-","");
-                if (pState.GrandmasterId != null && pState.GrandmasterId != gmId) Log(string.Format("[GM_CHANGE] {0} v2 GM -> {1}", ip, gmId));
+                if (pState.GmVerified && pState.GrandmasterId != gmId) {
+                    Log(string.Format("[GM_CHANGE] {0} v2 GM {1} -> {2}", ip, pState.GrandmasterId, gmId));
+                }
                 pState.GrandmasterId = gmId;
+                pState.GmVerified = true;
             }
 
             // Clear self-assigned/stale flags if the node is now a Follower
             if (role == "Follower") {
-                if (pState.GrandmasterId == ownId) pState.GrandmasterId = null;
+                if (pState.GrandmasterId == ownId) { pState.GrandmasterId = null; pState.GmVerified = false; }
                 pState.IsConflict = false; pState.ConflictStartedAtTicks = null;
             }
 
@@ -677,6 +766,10 @@ class Program {
                         if (pState.IsOnline && ElapsedSeconds(pState.LastRoleSeenTicks) >= OfflineTimeoutSeconds) {
                             pState.IsOnline = false;
                             pState.IsConflict = false; pState.ConflictStartedAtTicks = null; pState.GmMismatchLogged = false;
+                            // A stale verification must not survive an outage: if this instance comes back
+                            // sending only Sync (e.g. now under a different GM) it counts as unverified
+                            // until a fresh Announce / v1 Sync body confirms its GM again.
+                            pState.GmVerified = false;
                         }
                     }
                     double idle = ElapsedSeconds(dev.LastSeenTicks);
@@ -697,20 +790,39 @@ class Program {
                         }
                     }
                 }
+                var gmObservations = new List<KeyValuePair<ProtocolState, string>>();
                 foreach (var group in leaderGroups.Values) {
-                    bool conflicted = group.Count >= 2;
+                    // Several Leaders in one domain is NORMAL with Boundary Clocks (the GM and each BC
+                    // below it all send Sync/Announce). A real conflict is several distinct
+                    // Grandmasters: Leaders whose wire-verified GM IDs differ. Leaders whose GM is not
+                    // yet verified (no Announce / Sync body seen) are left out until it is.
+                    var gmIds = new SortedSet<string>(StringComparer.Ordinal);
                     foreach (var pState in group) {
-                        if (conflicted) {
+                        if (pState.GmVerified && !string.IsNullOrEmpty(pState.GrandmasterId)) gmIds.Add(pState.GrandmasterId);
+                    }
+                    bool conflicted = gmIds.Count >= 2;
+                    gmObservations.Add(new KeyValuePair<ProtocolState, string>(group[0], gmIds.Count == 1 ? gmIds.Min : null));
+                    foreach (var pState in group) {
+                        if (conflicted && pState.GmVerified) {
                             if (!pState.ConflictStartedAtTicks.HasValue) pState.ConflictStartedAtTicks = now;
                             double sec = ElapsedSeconds(pState.ConflictStartedAtTicks.Value);
                             if (sec >= ConflictPersistThresholdSeconds) {
-                                if (!pState.IsConflict) Log(string.Format("[CONFLICT_ALERT] Domain {0} ({1}) Persistent conflict detected (10s+).", pState.Domain, pState.Version));
+                                if (!pState.IsConflict) Log(string.Format("[CONFLICT_ALERT] Domain {0} ({1}) Persistent conflict detected ({2}s+): multiple Grandmasters {3}.", pState.Domain, pState.Version, ConflictPersistThresholdSeconds.ToString("0.##", CultureInfo.InvariantCulture), string.Join(", ", gmIds.ToArray())));
                                 pState.IsConflict = true;
                             }
                         } else {
                             pState.ConflictStartedAtTicks = null; pState.IsConflict = false;
                         }
                     }
+                }
+
+                // GM history: refresh every already-tracked domain first, then offer new ones, so a full
+                // table only ever evicts domains that were genuinely not active this sweep.
+                foreach (var obs in gmObservations) {
+                    if (domainGms.ContainsKey(StateKey(obs.Key.Version, obs.Key.Domain))) TrackDomainGm(obs.Key.Version, obs.Key.Domain, obs.Value, now);
+                }
+                foreach (var obs in gmObservations) {
+                    if (!domainGms.ContainsKey(StateKey(obs.Key.Version, obs.Key.Domain))) TrackDomainGm(obs.Key.Version, obs.Key.Domain, obs.Value, now);
                 }
 
                 // Expire confirmed topology links whose Leader is no longer valid (offline, or no
@@ -896,7 +1008,7 @@ class Program {
                 Log(string.Format("[SYSTEM] Offline devices cleared by WebUI ({0} nodes).", count));
                 res.StatusCode = 200;
             } else if (path == "/api/clear_all" && context.Request.HttpMethod == "POST") {
-                lock(devices) { devices.Clear(); topologyLinks.Clear(); }
+                lock(devices) { devices.Clear(); topologyLinks.Clear(); domainGms.Clear(); gmHistoryLimitWarned = false; }
                 lock(logLock) { logs.Clear(); }
                 Log("[SYSTEM] Network state and logs cleared by WebUI.");
                 res.StatusCode = 200;
@@ -932,6 +1044,7 @@ class Program {
                             sb.Append("\"syncLog\":").Append(pState.SyncLog.HasValue ? pState.SyncLog.Value.ToString() : "null");
                             sb.Append(",\"announceLog\":").Append(pState.AnnounceLog.HasValue ? pState.AnnounceLog.Value.ToString() : "null").Append(",");
                             sb.Append("\"gmId\":").Append(JsonStr(pState.GrandmasterId ?? ""));
+                            sb.Append(",\"gmVerified\":").Append(pState.GmVerified?"true":"false");
                             sb.Append(",\"vendor\":").Append(JsonStr(GetVendorSafe(dev.Mac))).Append(",");
                             sb.Append("\"gmPriority1\":").Append(pState.GmPriority1.HasValue ? pState.GmPriority1.Value.ToString() : "null").Append(",");
                             sb.Append("\"gmClass\":").Append(pState.GmClass.HasValue ? pState.GmClass.Value.ToString() : "null").Append(",");
@@ -942,6 +1055,23 @@ class Program {
                             sb.Append("\"parentIp\":").Append(JsonStr(parentIp)).Append(",");
                             sb.Append("\"linkConfirmed\":").Append(linkConfirmed?"true":"false").Append(",");
                             sb.Append("\"roleElapsedSeconds\":").Append(pState.RoleChangedAtTicks.HasValue?((int)ElapsedSeconds(pState.RoleChangedAtTicks.Value)).ToString():"-1").Append("}");
+                        }
+                        sb.Append("]}");
+                    }
+                    sb.Append("],\"gmHistory\":[");
+                    bool fh = true;
+                    foreach (var kv in domainGms) {
+                        var evs = kv.Value.Events;
+                        if (evs.Count == 0) continue;
+                        if (!fh) sb.Append(","); fh = false;
+                        // The dictionary key is the internal version+KeySep+domain composite; the version
+                        // part never contains KeySep, so splitting at the first one is unambiguous.
+                        string[] parts = kv.Key.Split(new string[] { KeySep }, 2, StringSplitOptions.None);
+                        sb.Append("{\"version\":").Append(JsonStr(parts[0])).Append(",\"domain\":").Append(JsonStr(parts.Length > 1 ? parts[1] : "")).Append(",\"settledGm\":").Append(JsonStr(kv.Value.Gm)).Append(",\"events\":[");
+                        for (int i = 0; i < evs.Count; i++) {
+                            var ev = evs[i];
+                            if (i > 0) sb.Append(",");
+                            sb.Append("{\"time\":").Append(JsonStr(ev.Time)).Append(",\"oldGm\":").Append(JsonStr(ev.OldGm)).Append(",\"newGm\":").Append(JsonStr(ev.NewGm)).Append("}");
                         }
                         sb.Append("]}");
                     }

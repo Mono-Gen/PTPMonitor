@@ -1,4 +1,4 @@
-# PTPMonitor User Manual (v1.8.1)
+# PTPMonitor User Manual (v1.9.0)
 
 PTPMonitor is a specialized protocol analyzer designed to capture PTP (Precision Time Protocol) v1 / v2 traffic, visualize device status, Boundary Clock (BC) operations, and network topology for high-precision diagnostic purposes.
 
@@ -17,9 +17,12 @@ PTPMonitor is a specialized protocol analyzer designed to capture PTP (Precision
 Based on `Delay_Resp` packet analysis, the tool provides an accurate tree view of which Followers are synchronized to which Leaders.
 
 ### 2. Intelligent Conflict Detection (BMCA Grace Period)
-When multiple Leaders exist in the same domain, the tool determines the severity based on duration:
-- **BMCA (Negotiating) [Yellow]**: Multiple leaders detected for **less than 10 seconds**. This is shown as a normal negotiation process during master switching.
-- **CONFLICT (Persistent) [Red]**: Conflict persisting for **10 seconds or more**. Recorded as a configuration error or dual-master fault in the logs (`[CONFLICT_ALERT]`).
+A conflict means **multiple distinct Grandmasters in the same domain**: Leaders whose GM ID, read from Announce (v2) / Sync (v1), differs. Several Leaders reporting the *same* GM (a GM plus the Boundary Clocks below it) is normal and is not flagged. A Leader whose GM has not been read yet (shown as `(own ID, awaiting GM report)`) is left out of the check until it is. Severity is determined by duration:
+- **BMCA (Negotiating) [Yellow]**: Multiple GMs detected for **less than 10 seconds**. This is shown as a normal negotiation process during master switching.
+- **CONFLICT (Persistent) [Red]**: Conflict persisting for **10 seconds or more**. Recorded as a configuration error or dual-master fault in the logs (`[CONFLICT_ALERT]`, which lists the GM IDs involved).
+
+### 2b. GM Change History
+Each domain has a collapsible `GM changes (N) — last settled GM: ...` list under its heading showing the 20 most recent Grandmaster changes (time, old GM → new GM). A change is recorded when the domain's online Leaders settle on a single verified GM that differs from the previously settled one, so a handover to a device that was never a GM before is covered, and a GM plus the Boundary Clocks below it (all reporting the same GM) produce one entry. Nothing is recorded while multiple GMs conflict. Detection runs once per second: a change appears within about a second when the old GM is demoted (e.g. starts sending Delay_Req), but if the old GM simply goes silent it takes the offline timeout (`OfflineTimeoutSeconds`, default 10 s) plus up to a second. The displayed GM is the *last settled* one and is kept while the domain has no Leader or the GMs conflict. At most 64 domains are tracked: a new domain only replaces one that is not currently active (if all 64 are active, the new one is skipped). The open/closed state of the list is kept across the dashboard's automatic refresh. Cleared by `↻ Network Clear`. A GM verification is dropped when the device goes offline, so a device that comes back sending only Sync stays out of the conflict check until it announces its GM again.
 
 ### 3. GM Mismatch Alert (Diagnostic)
 If a Follower receives a Grandmaster ID different from what its parent (Leader/BC) expects, a red alert (`⚠️ GM Mismatch!`) is displayed on the WebUI to notify users of topology issues. This check only runs once the parent link has been confirmed by a matching `Delay_Resp` (dashed border = unconfirmed, GM not yet verifiable); an unconfirmed Follower's inherited GM is labeled `(inherited, unverified)` instead.

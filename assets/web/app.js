@@ -21,6 +21,16 @@ function renderLogs(logsArr) {
     document.getElementById('l').innerHTML = filtered.map(log=>`<div>${esc(log)}</div>`).reverse().join('');
 }
 
+// Open/closed state of each domain's "GM changes" <details>, keyed by "version|domain". 'toggle' does
+// not bubble, so it is caught in the capture phase on document (the elements themselves are rebuilt
+// every poll and cannot hold their own listeners).
+const historyOpen = new Set();
+document.addEventListener('toggle', e => {
+    const t = e.target;
+    if (!t || !t.classList || !t.classList.contains('gm-history')) return;
+    if (t.open) historyOpen.add(t.dataset.key); else historyOpen.delete(t.dataset.key);
+}, true);
+
 function applySearchFilter() {
     const term = document.getElementById('searchBox').value.trim().toLowerCase();
     document.querySelectorAll('.node[data-search]').forEach(el => {
@@ -76,6 +86,19 @@ async function fetchUI() {
                     Domain ${esc(dom)}
                 </div>`;
 
+                // Recent GM changes for this (version, domain), newest first. Collapsed by default so a
+                // quiet network shows no extra noise; the summary carries the count.
+                const hist = (d.gmHistory || []).find(h => h.version === v && h.domain === dom);
+                if (hist && hist.events.length > 0) {
+                    // The whole domain block is re-rendered on every poll, which would otherwise snap an
+                    // opened <details> shut; its open state is kept in historyOpen and re-applied here.
+                    const hkey = v + '|' + dom;
+                    html += `<details class="gm-history" data-key="${esc(hkey)}"${historyOpen.has(hkey) ? ' open' : ''}><summary>GM changes (${hist.events.length}) — last settled GM: <span style="font-family:monospace">${esc(hist.settledGm)}</span></summary>` +
+                        hist.events.slice().reverse().map(e =>
+                            `<div class="info-row" style="font-family:monospace">${esc(e.time)} ${esc(e.oldGm)} → ${esc(e.newGm)}</div>`
+                        ).join('') + `</details>`;
+                }
+
                 const domainNodes = instances.filter(i => i.p.domain === dom);
                 const cmap = {}; const roots = []; const rendered = new Set();
 
@@ -112,7 +135,7 @@ async function fetchUI() {
                     const gmInferred = (role === 'follower' && !p.gmId && !!parentGmId);
                     let gmIdText = p.gmId || (role === 'follower' ? parentGmId : 'N/A');
                     let gmStyle = isMismatch ? 'color:#ff4a4a;font-weight:bold;background:rgba(255,50,50,0.1);padding:2px 4px;border-radius:4px;' : 'opacity:0.9;';
-                    let gmLine = `<div class="info-row" style="${gmStyle}margin-top:6px;font-family:monospace;">GM: ${esc(gmIdText)}${gmInferred?' <span class="unconfirmed-note">(inherited, unverified)</span>':''}${isMismatch?' <span style="margin-left:4px;">⚠ GM Mismatch!</span>':''}</div>`;
+                    let gmLine = `<div class="info-row" style="${gmStyle}margin-top:6px;font-family:monospace;">GM: ${esc(gmIdText)}${gmInferred?' <span class="unconfirmed-note">(inherited, unverified)</span>':''}${(role === 'leader' && !p.gmVerified)?' <span class="unconfirmed-note">(own ID, awaiting GM report)</span>':''}${isMismatch?' <span style="margin-left:4px;">⚠ GM Mismatch!</span>':''}</div>`;
                     let logLine = (role === 'leader' && v === 'v2') ? `<div class="info-row" style="opacity:0.7">Sync: ${valS(p.syncLog)} / Announce: ${valS(p.announceLog)}</div>` : '';
                     let bmcLine = (role === 'leader' && v === 'v2' && p.gmPriority1 !== null) ? `<div class="info-row" style="opacity:0.7">BMC: P1=${valS(p.gmPriority1)} / Class=${valS(p.gmClass)} / P2=${valS(p.gmPriority2)}</div>` : '';
 

@@ -18,6 +18,15 @@ Run `PTPMonitor.exe` (requires proper configuration in `config.ini`).
 
 ## Changelog
 
+### [v1.9.0] - 2026-11-21
+#### Fixed
+- **Conflict False Positives with Boundary Clocks**: A conflict was previously raised whenever 2+ Leaders existed in the same (version, domain), which is the normal state of a GM plus a Boundary Clock. It now requires 2+ *distinct wire-verified Grandmaster IDs* (from Announce / v1 Sync body). Leaders whose GM has not yet been read are excluded until it is.
+- **Spurious GM_CHANGE**: A Leader's provisional self-ID (used before its first GM report) is no longer treated as a previous GM, so the first Announce no longer logs a bogus `[GM_CHANGE]`.
+- The `[CONFLICT_ALERT]` message now reflects the configured threshold instead of a fixed "10s+", and lists the GM IDs involved.
+#### Added
+- **GM Change History**: Per-domain list of the 20 most recent GM changes in the Web UI (`/api/data` → `gmHistory`). A change is recorded when the domain's online Leaders settle on a single verified GM different from the previously settled one (so handovers to a new device are covered, and a GM plus its Boundary Clocks count once); nothing is recorded during a multi-GM conflict. Up to 64 domains are tracked; a new domain only replaces a currently inactive one. The list stays open across the dashboard's auto-refresh. A leader showing only its own provisional ID is labeled `(own ID, awaiting GM report)`.
+- A device's GM verification is now dropped when it goes offline (or its clock identity changes), so a device returning with Sync only cannot produce a false conflict from a stale GM.
+
 ### [v1.8.1] - 2026-08-01
 #### Fixed
 - **Resource Exhaustion Guards**: Per-device (PTP version, domain) instance count is now capped (`MaxProtocolStatesPerDevice`), preventing a single spoofed source from growing memory/scan cost unbounded via arbitrary PTPv1 subdomains. The 512-device table now evicts the least-recently-seen device (LRU) instead of rejecting new ones once full, so spoofed IP churn can no longer permanently lock out real devices.

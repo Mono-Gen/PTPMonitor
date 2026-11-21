@@ -18,6 +18,13 @@ Run `PTPMonitor.exe` (requires proper configuration in `config.ini`). To analyze
 
 ## Changelog
 
+### [v1.17.0] - 2026-11-21
+#### Added
+- **Event timeline**: a structured, bounded history of what started, changed and **ended**, shown in a new Timeline panel (filter by group, search, click a row to jump to the node) and available as `GET /api/events` (JSON or CSV; `since`/`type`/`ip`/`domain`/`limit` filters, strict validation, `epoch`/`dropped` so nothing is lost silently). Previously a Conflict, GM mismatch, mixed delay mechanism, Announce timeout or interval mismatch was logged only when it *started*; each now also records when it **ended**, with its duration, including when it ends because the devices went offline or were removed.
+- One event per episode: a domain-level problem produces one `START` however many Leaders are involved (the text log still prints one line per Leader, unchanged) and one `END`; a recurrence is a new episode.
+- JSON / CSV export from the page: UTF-8 BOM, ISO 8601 times with the UTC offset, and spreadsheet-formula neutralization (PTPv1 subdomains come from packet bytes). The last 5,000 events are kept in memory (50,000 for a pcap analysis, with the capture's own times); the history is not saved to disk, and "Network Clear" empties it (recorded as a `SYSTEM` event).
+- The existing text log, the 500-line log view and the log file are unchanged.
+
 ### [v1.16.0] - 2026-11-21
 #### Added
 - **Unattended start**: `--nic <IPv4|number|description text>`, `--port N`, `--no-prompt`, `--version`, `--help`, and `Nic` / `WebPort` / `WebBind` in `config.ini` (the command line wins). With the interface given nothing is prompted. A bad value, an ambiguous or unknown interface, or a dashboard that cannot start is an error (exit codes: 0 ok, 1 runtime failure, 2 bad arguments/settings) instead of a silent default. With no console input at all (end of input) the program exits with an error instead of silently choosing interface 1.

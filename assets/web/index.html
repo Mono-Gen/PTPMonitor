@@ -1,9 +1,9 @@
-<!DOCTYPE html><html><head><meta charset="UTF-8"><title>PTPMonitor v1.16.0</title>
+<!DOCTYPE html><html><head><meta charset="UTF-8"><title>PTPMonitor v1.17.0</title>
 <style>__STYLE_PLACEHOLDER__</style>
 </head><body><div class="container">
 <header>
     <div>
-        <h1 style="margin:0">PTP Monitor <small style="font-size:0.5em;opacity:0.5">v1.16.0</small></h1>
+        <h1 style="margin:0">PTP Monitor <small style="font-size:0.5em;opacity:0.5">v1.17.0</small></h1>
         <div class="live-indicator" style="margin-top:8px">
             <span class="dot"></span>
             <span id="liveLabel">LIVE MONITORING</span>
@@ -26,6 +26,26 @@
 <div class="grid">
 <div class="glass"><h3>📡 v1 Topology</h3><div id="v1"></div></div>
 <div class="glass"><h3>📡 v2 Topology</h3><div id="v2"></div></div>
+</div>
+<div class="glass" id="timelinePanel" style="margin-bottom:1.5rem">
+    <div class="tl-head">
+        <h3 style="margin:0">🕒 Timeline</h3>
+        <div class="tl-actions">
+            <a class="tl-btn" href="/api/events?format=json&limit=100000" download="ptp_events.json">⬇ JSON</a>
+            <a class="tl-btn" href="/api/events?format=csv&limit=100000" download="ptp_events.csv">⬇ CSV</a>
+        </div>
+    </div>
+    <div class="log-filters" id="tlFilters">
+        <button data-group="ALL" class="active" onclick="setTlGroup('ALL')">ALL</button>
+        <button data-group="ALERT" onclick="setTlGroup('ALERT')">Alerts</button>
+        <button data-group="ROLE" onclick="setTlGroup('ROLE')">Roles &amp; GM</button>
+        <button data-group="PRESENCE" onclick="setTlGroup('PRESENCE')">Presence</button>
+        <button data-group="TIMING" onclick="setTlGroup('TIMING')">Timing</button>
+        <input type="text" id="tlSearch" class="search-input" placeholder="Filter by IP / domain / text..." oninput="renderTimeline()">
+    </div>
+    <div id="tlNote" class="tl-note"></div>
+    <div id="tl" class="timeline"></div>
+    <button id="tlMore" onclick="tlShowMore()" style="display:none;margin-top:0.5rem">Show more</button>
 </div>
 <div class="glass">
     <h3>Event Logs</h3>

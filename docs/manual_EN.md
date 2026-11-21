@@ -1,4 +1,4 @@
-# PTPMonitor User Manual (v1.13.0)
+# PTPMonitor User Manual (v1.14.0)
 
 PTPMonitor is a specialized protocol analyzer designed to capture PTP (Precision Time Protocol) v1 / v2 traffic, visualize device status, Boundary Clock (BC) operations, and network topology for high-precision diagnostic purposes.
 
@@ -78,6 +78,24 @@ Each domain heading may carry a small `hint:` showing which PTP profile the doma
 - Any other number: no hint.
 
 The values come from vendor and standards-body documentation, not from the standards' full text. The IEEE 1588 default profile's default domain and Dante's PTPv1 subdomain names could not be confirmed, so they are deliberately not shown.
+
+### 11. Offline Analysis of Captures (pcap / pcapng)
+A capture taken with Wireshark/tcpdump can be analyzed later with the same parser and the same diagnoses as live monitoring (no administrator rights, no network access):
+
+```
+PTPMonitor.exe --pcap capture.pcapng [--port 8080]    # analyze, then open the dashboard
+PTPMonitor.exe --pcap capture.pcap --summary          # no dashboard: print events and a device table, then exit
+```
+Exit codes: `0` success (a truncated or partly damaged file still gives `0` with a warning), `1` the capture could not be read, `2` bad arguments.
+
+- **Formats**: classic pcap (microsecond or nanosecond, either byte order) and pcapng (any byte order, several sections, `if_tsresol` / `if_tsoffset`). Compressed files (`.gz`) must be decompressed first.
+- **What is analyzed**: Ethernet (also with one or two VLAN tags), raw IP and raw IPv4 captures, PTP over UDP/IPv4 on ports 319/320. Everything else is **counted by reason and reported, never guessed**: IPv6, Layer-2 PTP (EtherType 0x88F7), IPv4 fragments, non-UDP, other ports, UDP payloads over 2048 bytes (the live receiver drops them too), UDP datagrams the capture recorded only partly (snap length; the live receiver would have seen them whole), UDP lengths that do not fit their IPv4 packet, and link types other than the above (e.g. Linux cooked capture, whose header layout was not verified).
+- **Time**: all timers run on the capture's own timestamps, not the real clock. Log lines carry the capture time, an idle gap (e.g. hours) is fast-forwarded without losing the events inside it (timers that fire there, such as offline or Announce timeout, and retention removals are logged at their true capture time), and out-of-order timestamps never move the clock backwards. A capture without timestamps (pcapng *Simple Packet Blocks* only) is still read, but timer-based diagnoses (offline, persistence, Announce timeout) cannot be evaluated and a warning says so.
+- **What the dashboard shows**: the state at the **end of the capture**, frozen. A problem that came and went during the capture (for example a conflict that had resolved) is no longer in the node state; **look in the event log** (or the `--summary` output) for it. A banner shows the file, the time range and the skipped-packet counts; the clear buttons are disabled.
+- **Safety**: the file is treated as untrusted input and opened read-only. Oversized records or blocks are refused rather than allocated, a damaged file yields what could be read plus a warning, and no log file is written.
+
+> [!NOTE]
+> This has been verified against hand-built capture files only; please check it with your own captures. Every packet in a capture goes through exactly the same processing as a live packet, so any difference from what you saw live is worth reporting.
 
 ## WebUI Operations
 - **Uptime / Offline**: Real-time display of uptime for active devices or elapsed time since disconnection for offline devices. Uptime resets (and a `[REJOIN]` log entry is added) when a device comes back online after being offline.

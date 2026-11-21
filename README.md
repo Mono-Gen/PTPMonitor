@@ -14,9 +14,16 @@ PTP (Precision Time Protocol) monitoring and diagnostic tool.
 - [Manual (ENG)](docs/manual_EN.md)
 
 ## How to use
-Run `PTPMonitor.exe` (requires proper configuration in `config.ini`).
+Run `PTPMonitor.exe` (requires proper configuration in `config.ini`). To analyze a Wireshark/tcpdump capture instead of monitoring live: `PTPMonitor.exe --pcap capture.pcapng` (see the manual).
 
 ## Changelog
+
+### [v1.14.0] - 2026-11-21
+#### Added
+- **Offline analysis of pcap / pcapng captures**: `PTPMonitor.exe --pcap <file> [--port N]` replays a capture through the same parser and the same periodic evaluation as live monitoring and shows the (frozen) result on the dashboard; `--summary` prints the events and a device table and exits (exit codes: 0 ok, 1 unreadable capture, 2 bad arguments). Classic pcap (µs/ns, both byte orders) and pcapng (both byte orders, several sections, `if_tsresol`/`if_tsoffset`); Ethernet (up to two VLAN tags), raw IP and raw IPv4. Packets that cannot be analyzed (IPv6, Layer-2 PTP, fragments, non-UDP, other ports, oversize UDP, unsupported link types such as Linux cooked) are counted by reason, never guessed. The dashboard shows an analysis banner, the clear buttons are disabled and the clear API answers 409.
+- All timers run on a **virtual clock taken from the capture's timestamps** (log lines carry the capture time; long idle gaps are fast-forwarded without losing the events inside them; out-of-order timestamps never move the clock back). The periodic evaluation was extracted into `SweepOnce()` with no change in logic, and every time reference now goes through one clock.
+- The capture is treated as untrusted input: read-only, streamed, bounded record/block sizes, damaged files give what could be read plus a warning, no log file is written. No new dependency.
+- Verified only with hand-built capture files, not with real Wireshark captures.
 
 ### [v1.13.0] - 2026-11-21
 #### Added

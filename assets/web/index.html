@@ -1,22 +1,23 @@
-<!DOCTYPE html><html><head><meta charset="UTF-8"><title>PTPMonitor v1.13.0</title>
+<!DOCTYPE html><html><head><meta charset="UTF-8"><title>PTPMonitor v1.14.0</title>
 <style>__STYLE_PLACEHOLDER__</style>
 </head><body><div class="container">
 <header>
     <div>
-        <h1 style="margin:0">PTP Monitor <small style="font-size:0.5em;opacity:0.5">v1.13.0</small></h1>
+        <h1 style="margin:0">PTP Monitor <small style="font-size:0.5em;opacity:0.5">v1.14.0</small></h1>
         <div class="live-indicator" style="margin-top:8px">
             <span class="dot"></span>
-            <span>LIVE MONITORING</span>
+            <span id="liveLabel">LIVE MONITORING</span>
             <span style="margin-left:8px;opacity:0.6">|</span>
             <span id="last-update" style="margin-left:8px">Waiting for data...</span>
         </div>
     </div>
     <div class="header-actions">
-        <button onclick="if(confirm('Reset all network data and logs?')) { fetch('/api/clear_all',{method:'POST'}).then(fetchUI); }">↻ Network Clear</button>
-        <button onclick="if(confirm('Clear all offline devices from the list?')) { fetch('/api/clear_offline',{method:'POST'}).then(fetchUI); }">🗑 Clear Offline</button>
+        <button id="btnClearAll" onclick="if(confirm('Reset all network data and logs?')) { fetch('/api/clear_all',{method:'POST'}).then(fetchUI); }">↻ Network Clear</button>
+        <button id="btnClearOffline" onclick="if(confirm('Clear all offline devices from the list?')) { fetch('/api/clear_offline',{method:'POST'}).then(fetchUI); }">🗑 Clear Offline</button>
         <button onclick="exportCSV()">⬇ Export CSV</button>
     </div>
 </header>
+<div id="analysisBanner"></div>
 <div id="alertBanner"></div>
 <div class="toolbar">
     <input type="text" id="searchBox" class="search-input" placeholder="Search IP / MAC / Vendor..." oninput="applySearchFilter()">
